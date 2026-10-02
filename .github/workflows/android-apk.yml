@@ -1,0 +1,105 @@
+name: android-apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App
+        required: true
+      version_code:
+        description: 'Play version code, e.g. 50'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+      - name: Fetch the universal APK from Play
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_JSON }}
+          PACKAGE: ${{ env.CFG_PACKAGE }}
+          CODE: ${{ inputs.version_code }}
+        run: |
+          pip install --quiet google-auth requests
+          printf '%s' "$PLAY_JSON" > "$RUNNER_TEMP/play.json"
+          python3 - <<'PY'
+          import os, requests, google.oauth2.service_account as sa, google.auth.transport.requests as tr
+          creds = sa.Credentials.from_service_account_file(os.environ['RUNNER_TEMP'] + '/play.json',
+              scopes=['https://www.googleapis.com/auth/androidpublisher'])
+          creds.refresh(tr.Request())
+          h = {'Authorization': 'Bearer ' + creds.token}
+          base = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{os.environ['PACKAGE']}/generatedApks/{os.environ['CODE']}"
+          apks = requests.get(base, headers=h, timeout=60).json()['generatedApks']
+          uid = apks[0]['generatedUniversalApk']['downloadId']
+          r = requests.get(f"{base}/downloads/{uid}:download", params={'alt': 'media'}, headers=h, timeout=1200, stream=True)
+          r.raise_for_status()
+          with open('app.apk', 'wb') as f:
+              for chunk in r.iter_content(1 << 20):
+                  f.write(chunk)
+          print('downloaded', os.path.getsize('app.apk'), 'bytes')
+          PY
+          rm -f "$RUNNER_TEMP/play.json"
+
+      - name: Check the signature and read the version
+        id: check
+        env:
+          SIGNER: ${{ env.CFG_SIGNER }}
+          CODE: ${{ inputs.version_code }}
+        run: |
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$bt/apksigner" verify --print-certs app.apk > signers.txt
+          grep 'certificate SHA-256 digest' signers.txt
+          grep -q "certificate SHA-256 digest: $SIGNER" signers.txt ||
+            { echo "not signed with Play's app-signing key"; exit 1; }
+          badge=$("$bt/aapt2" dump badging app.apk | head -1)
+          name=$(sed -nE "s/.*versionName='([^']+)'.*/\1/p" <<<"$badge")
+          code=$(sed -nE "s/.*versionCode='([0-9]+)'.*/\1/p" <<<"$badge")
+          [ "$code" = "$CODE" ] || { echo "version code $code, expected $CODE"; exit 1; }
+          echo "version=$name+$code" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to the download page
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "apk $APP $VERSION" < app.apk
+          rm -f ~/.ssh/dl

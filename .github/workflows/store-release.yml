@@ -1,0 +1,690 @@
+name: store-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App
+        required: true
+      ref:
+        description: Branch or commit of the private repository
+        default: main
+      ios:
+        description: iOS
+        type: boolean
+        default: true
+      android:
+        description: Android
+        type: boolean
+        default: true
+      mac:
+        description: macOS
+        type: boolean
+        default: true
+      deploy:
+        description: Upload and publish (off = build, sign and check only)
+        type: boolean
+        default: true
+      play_track:
+        description: Google Play track, for apps on Play (production is a 100% rollout)
+        type: choice
+        options: [production, beta, alpha, internal]
+        default: production
+      submit:
+        description: After uploading, submit for App Store review or hand to TestFlight groups
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-a-${{ inputs.app }}-${{ inputs.ios }}-${{ inputs.android }}-${{ inputs.mac }}-${{ inputs.deploy }}
+  cancel-in-progress: false
+
+env:
+  LANG: en_US.UTF-8
+  LC_ALL: en_US.UTF-8
+  FASTLANE_SKIP_UPDATE_CHECK: "1"
+  FASTLANE_HIDE_CHANGELOG: "1"
+  FASTLANE_HIDE_TIMESTAMP: "1"
+  FASTLANE_VERSION: "2.236.0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+  android:
+    needs: plan
+    if: inputs.android
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.A_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PRIVATE_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: |
+            ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+            ${{ env.CFG_ROOT }}/packages
+            ${{ env.CFG_ROOT }}/changelogs
+          sparse-checkout-cone-mode: true
+
+      - name: Room on the disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h / | tail -1
+
+      - name: Version
+        id: version
+        run: |
+          line=$(grep -E '^version: [0-9.]+\+[0-9]+' "$APP_DIR/pubspec.yaml")
+          echo "name=$(sed -E 's/^version: ([0-9.]+)\+([0-9]+).*/\1/' <<<"$line")" >> "$GITHUB_OUTPUT"
+          echo "code=$(sed -E 's/^version: ([0-9.]+)\+([0-9]+).*/\2/' <<<"$line")" >> "$GITHUB_OUTPUT"
+          echo "$line"
+
+      - name: Release notes
+        run: python3 scripts/release_notes.py "src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}.md" "$RUNNER_TEMP/notes"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.1
+          cache: true
+
+      - name: Gradle within this machine
+        run: |
+          mkdir -p ~/.gradle
+          {
+            echo "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:ReservedCodeCacheSize=256m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+            echo "org.gradle.workers.max=3"
+            echo "kotlin.compiler.execution.strategy=in-process"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Upload key
+        env:
+          KEYSTORE_B64: ${{ secrets[format('ANDROID_KEYSTORE_{0}_BASE64', env.CFG_SUFFIX)] }}
+          KEY_PROPERTIES: ${{ secrets[format('ANDROID_KEY_PROPERTIES_{0}', env.CFG_SUFFIX)] }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64" && test -n "$KEY_PROPERTIES" || { echo "::error::the Android upload key secrets are not set (setup)"; exit 1; }
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/upload.jks"
+          {
+            printf '%s\n' "$KEY_PROPERTIES"
+            echo "storeFile=$RUNNER_TEMP/upload.jks"
+          } > "$APP_DIR/android/key.properties"
+
+      - name: Resolve packages
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get --enforce-lockfile
+
+      - name: flutter_avif_android's duplicate plugin class
+        run: |
+          find "$PUB_CACHE/hosted/pub.dev" -path '*flutter_avif_android-*/android/src/main/java/*/FlutterAvifPlugin.java' -print -delete
+
+      - name: Build
+        id: build
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ "$DEST" = play ]; then
+            flutter build appbundle --release
+            echo "artifact=$APP_DIR/build/app/outputs/bundle/release/app-release.aab" >> "$GITHUB_OUTPUT"
+          else
+            flutter build apk --release
+            echo "artifact=$APP_DIR/build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse a build not signed with the upload key
+        env:
+          KEY_PROPERTIES: ${{ secrets[format('ANDROID_KEY_PROPERTIES_{0}', env.CFG_SUFFIX)] }}
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          norm() { tr -d ': ' | tr 'A-F' 'a-f'; }
+          pass=$(sed -n 's/^storePassword=//p' <<<"$KEY_PROPERTIES")
+          alias=$(sed -n 's/^keyAlias=//p' <<<"$KEY_PROPERTIES")
+          want=$(keytool -list -v -keystore "$RUNNER_TEMP/upload.jks" -storepass "$pass" -alias "$alias" 2>/dev/null | sed -n 's/^.*SHA256: //p' | head -1 | norm)
+          if [ "$DEST" = play ]; then
+            got=$(keytool -printcert -jarfile "$ARTIFACT" 2>/dev/null | sed -n 's/^.*SHA256: //p' | head -1 | norm)
+          else
+            signer="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+            got=$("$signer" verify --print-certs "$ARTIFACT" 2>/dev/null | sed -n 's/^.*certificate SHA-256 digest: //p' | head -1 | norm)
+          fi
+          [ -n "$want" ] && [ "$want" = "$got" ] || { echo "::error::the build is not signed with the upload key"; exit 1; }
+          ls -l "$ARTIFACT" | awk '{print "built:", $5, "bytes"}'
+
+      - name: What R8 kept
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+          RAW_MIN: ${{ env.CFG_RAW_MIN }}
+        run: |
+          set -euo pipefail
+          if [ "$DEST" = play ]; then
+            unzip -p "$ARTIFACT" BUNDLE-METADATA/com.android.tools/r8.json 2>/dev/null |
+              grep -oE '"(is[A-Za-z]*(Shrink|Optimiz)[A-Za-z]*|isSignatureKept|version)":[^,}]*' || true
+          fi
+          raw=$(unzip -l "$ARTIFACT" | grep -c 'res/raw/' || true)
+          echo "res/raw entries: $raw (at least $RAW_MIN)"
+          [ "$raw" -ge "$RAW_MIN" ] || { echo "::error::R8 left $raw raw resources, expected at least $RAW_MIN"; exit 1; }
+
+      - name: Release on Google Play
+        if: inputs.deploy && env.DEST == 'play'
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_JSON }}
+        run: |
+          pip install --quiet google-api-python-client google-auth google-auth-httplib2
+          python3 scripts/play_release.py "${{ env.CFG_PACKAGE }}" \
+            "${{ steps.build.outputs.artifact }}" \
+            "${{ inputs.play_track }}" "${{ steps.version.outputs.name }}" \
+            "${{ steps.version.outputs.code }}" "$RUNNER_TEMP/notes/play.txt"
+
+      - name: Publish the APK on the website
+        if: inputs.deploy && env.DEST == 'site_apk'
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.version.outputs.name }}+${{ steps.version.outputs.code }}
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "apk $APP $VERSION" < "$ARTIFACT"
+          rm -f ~/.ssh/dl
+
+      - name: Clean up the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.jks" "$APP_DIR/android/key.properties"
+
+  ios:
+    needs: plan
+    if: inputs.ios
+    runs-on: macos-26
+    timeout-minutes: 120
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+      code: ${{ steps.version.outputs.code }}
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.A_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PRIVATE_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: |
+            ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+            ${{ env.CFG_ROOT }}/packages
+            ${{ env.CFG_ROOT }}/changelogs
+          sparse-checkout-cone-mode: true
+
+      - name: Version
+        id: version
+        run: |
+          line=$(grep -E '^version: [0-9.]+\+[0-9]+' "$APP_DIR/pubspec.yaml")
+          echo "name=$(sed -E 's/^version: ([0-9.]+)\+([0-9]+).*/\1/' <<<"$line")" >> "$GITHUB_OUTPUT"
+          echo "code=$(sed -E 's/^version: ([0-9.]+)\+([0-9]+).*/\2/' <<<"$line")" >> "$GITHUB_OUTPUT"
+          echo "$line"
+
+      - name: Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: fastlane
+        run: gem install fastlane -v "$FASTLANE_VERSION" --no-document
+
+      - name: Version and build on App Store Connect
+        run: fastlane preflight platform:IOS strict:${{ inputs.deploy }} bundle:${{ env.CFG_BUNDLE }} version:${{ steps.version.outputs.name }} build:${{ steps.version.outputs.code }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.1
+          cache: true
+
+      - name: Signing
+        env:
+          IOS_CI_P12_BASE64: ${{ secrets.IOS_CI_P12_BASE64 }}
+          IOS_CI_P12_PASSWORD: ${{ secrets.IOS_CI_P12_PASSWORD }}
+          IOS_CI_CERT_ID: ${{ vars.IOS_CI_CERT_ID }}
+          IOS_TARGETS_JSON: ${{ env.CFG_TARGETS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$IOS_CI_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/ci.p12"
+          export IOS_CI_P12_PATH="$RUNNER_TEMP/ci.p12"
+          fastlane ios_signing project:"$GITHUB_WORKSPACE/$APP_DIR/ios/Runner.xcodeproj" export_options:"$RUNNER_TEMP/ExportOptions.plist"
+          rm -f "$RUNNER_TEMP/ci.p12"
+
+      - name: Build the ipa
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter build ipa --release --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Check the ipa
+        env:
+          EXPECT: ${{ env.CFG_IOS_EXPECT }}
+          EMBEDS: ${{ env.CFG_IOS_EMBEDS }}
+        run: |
+          set -euo pipefail
+          ipa=$(ls "$APP_DIR"/build/ios/ipa/*.ipa | head -1)
+          echo "ipa=$ipa" >> "$GITHUB_ENV"
+          rm -rf "$RUNNER_TEMP/ipa" && mkdir -p "$RUNNER_TEMP/ipa" && unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
+          app="$RUNNER_TEMP/ipa/Payload/Runner.app"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null || true; }
+          short=$(pb CFBundleShortVersionString "$app/Info.plist")
+          build=$(pb CFBundleVersion "$app/Info.plist")
+          echo "ipa: $short ($build), $(du -h "$ipa" | cut -f1)"
+          [ "$short" = "${{ steps.version.outputs.name }}" ] && [ "$build" = "${{ steps.version.outputs.code }}" ] ||
+            { echo "::error::the ipa is $short ($build), the pubspec says ${{ steps.version.outputs.name }} (${{ steps.version.outputs.code }})"; exit 1; }
+          codesign -d --entitlements :- "$app" 2>/dev/null > "$RUNNER_TEMP/ent.plist"
+          for kv in $EXPECT; do
+            k=${kv%%=*}; v=${kv#*=}; got=$(pb "$k" "$RUNNER_TEMP/ent.plist")
+            if [ "$v" = "*" ]; then [ -n "$got" ] || { echo "::error::entitlement $k is missing"; exit 1; }
+            else [ "$got" = "$v" ] || { echo "::error::entitlement $k is '$got', expected '$v'"; exit 1; }; fi
+          done
+          for d in $EMBEDS; do [ -d "$app/$d" ] || { echo "::error::no $d in the app"; exit 1; }; done
+          echo "entitlements and embedded bundles as expected"
+
+      - name: Upload to App Store Connect
+        if: inputs.deploy
+        run: fastlane ios_upload bundle:${{ env.CFG_BUNDLE }} ipa:"$ipa"
+
+  ios_submit:
+    needs: [plan, ios]
+    if: inputs.deploy && inputs.submit && needs.ios.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.A_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PRIVATE_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: ${{ env.CFG_ROOT }}/changelogs
+          sparse-checkout-cone-mode: true
+
+      - name: Release notes
+        run: python3 scripts/release_notes.py "src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}.md" "$RUNNER_TEMP/notes"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: fastlane
+        run: gem install fastlane -v "$FASTLANE_VERSION" --no-document
+
+      - name: Wait for Apple's processing, then submit or hand to testers
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          APP_REVIEW_CONTACT_FIRST_NAME: ${{ secrets.APP_REVIEW_CONTACT_FIRST_NAME }}
+          APP_REVIEW_CONTACT_LAST_NAME: ${{ secrets.APP_REVIEW_CONTACT_LAST_NAME }}
+          APP_REVIEW_CONTACT_EMAIL: ${{ secrets.APP_REVIEW_CONTACT_EMAIL }}
+          APP_REVIEW_CONTACT_PHONE: ${{ secrets.APP_REVIEW_CONTACT_PHONE }}
+          DEST: ${{ env.CFG_APPLE_DEST }}
+          GROUPS: ${{ env.CFG_TESTFLIGHT_GROUPS }}
+        run: |
+          if [ "$DEST" = testflight ]; then
+            ruby scripts/testflight.rb IOS "${{ env.CFG_BUNDLE }}" \
+              "${{ needs.ios.outputs.name }}" "${{ needs.ios.outputs.code }}" "$RUNNER_TEMP/notes/full.txt" "$GROUPS"
+          else
+            ruby scripts/submit.rb IOS "${{ env.CFG_BUNDLE }}" \
+              "${{ needs.ios.outputs.name }}" "${{ needs.ios.outputs.code }}" "$RUNNER_TEMP/notes/full.txt"
+          fi
+
+  mac:
+    needs: plan
+    if: inputs.mac
+    runs-on: macos-26
+    timeout-minutes: 120
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+      code: ${{ steps.version.outputs.code }}
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.A_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PRIVATE_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: |
+            ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+            ${{ env.CFG_ROOT }}/packages
+            ${{ env.CFG_ROOT }}/changelogs
+          sparse-checkout-cone-mode: true
+
+      - name: Version
+        id: version
+        run: |
+          line=$(grep -E '^version: [0-9.]+\+[0-9]+' "$APP_DIR/pubspec.yaml")
+          echo "name=$(sed -E 's/^version: ([0-9.]+)\+([0-9]+).*/\1/' <<<"$line")" >> "$GITHUB_OUTPUT"
+          echo "code=$(sed -E 's/^version: ([0-9.]+)\+([0-9]+).*/\2/' <<<"$line")" >> "$GITHUB_OUTPUT"
+          echo "$line"
+
+      - name: Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: fastlane
+        run: gem install fastlane -v "$FASTLANE_VERSION" --no-document
+
+      - name: Version and build on App Store Connect
+        run: fastlane preflight platform:MAC_OS strict:${{ inputs.deploy }} bundle:${{ env.CFG_BUNDLE }} version:${{ steps.version.outputs.name }} build:${{ steps.version.outputs.code }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.1
+          cache: true
+
+      - name: Signing
+        env:
+          IOS_CI_P12_BASE64: ${{ secrets.IOS_CI_P12_BASE64 }}
+          IOS_CI_P12_PASSWORD: ${{ secrets.IOS_CI_P12_PASSWORD }}
+          IOS_CI_CERT_ID: ${{ vars.IOS_CI_CERT_ID }}
+          MAC_INSTALLER_P12_BASE64: ${{ secrets.MAC_INSTALLER_P12_BASE64 }}
+          MAC_INSTALLER_P12_PASSWORD: ${{ secrets.MAC_INSTALLER_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$MAC_INSTALLER_P12_BASE64" || { echo "::error::MAC_INSTALLER_P12_BASE64 is not set (setup)"; exit 1; }
+          printf '%s' "$IOS_CI_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/ci.p12"
+          printf '%s' "$MAC_INSTALLER_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/installer.p12"
+          export IOS_CI_P12_PATH="$RUNNER_TEMP/ci.p12" MAC_INSTALLER_P12_PATH="$RUNNER_TEMP/installer.p12"
+          fastlane mac_signing bundle:${{ env.CFG_BUNDLE }} project:"$GITHUB_WORKSPACE/$APP_DIR/macos/Runner.xcodeproj" export_options:"$RUNNER_TEMP/ExportOptionsMac.plist"
+          rm -f "$RUNNER_TEMP/ci.p12" "$RUNNER_TEMP/installer.p12"
+
+      - name: Build the pkg
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          flutter build macos --release
+          xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Release \
+            -archivePath "$RUNNER_TEMP/mac.xcarchive" archive -quiet
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/mac.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptionsMac.plist" -exportPath "$RUNNER_TEMP/mac-export" -quiet
+
+      - name: Check the pkg
+        env:
+          EXPECT: ${{ env.CFG_MAC_EXPECT }}
+        run: |
+          set -euo pipefail
+          pkg=$(ls "$RUNNER_TEMP"/mac-export/*.pkg | head -1)
+          echo "pkg=$pkg" >> "$GITHUB_ENV"
+          pkgutil --check-signature "$pkg" | grep -q "3rd Party Mac Developer Installer" ||
+            { echo "::error::the pkg is not signed with the Mac installer certificate"; exit 1; }
+          rm -rf "$RUNNER_TEMP/pkg" && pkgutil --expand-full "$pkg" "$RUNNER_TEMP/pkg"
+          app=$(find "$RUNNER_TEMP/pkg" -maxdepth 4 -name '*.app' -type d | head -1)
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null || true; }
+          short=$(pb CFBundleShortVersionString "$app/Contents/Info.plist")
+          build=$(pb CFBundleVersion "$app/Contents/Info.plist")
+          echo "pkg: $short ($build), $(du -h "$pkg" | cut -f1)"
+          [ "$short" = "${{ steps.version.outputs.name }}" ] && [ "$build" = "${{ steps.version.outputs.code }}" ] ||
+            { echo "::error::the pkg is $short ($build), the pubspec says ${{ steps.version.outputs.name }} (${{ steps.version.outputs.code }})"; exit 1; }
+          codesign -d --entitlements :- "$app" 2>/dev/null > "$RUNNER_TEMP/ent-mac.plist"
+          [ "$(pb com.apple.security.get-task-allow "$RUNNER_TEMP/ent-mac.plist")" != true ] ||
+            { echo "::error::get-task-allow is set: the Mac App Store refuses it"; exit 1; }
+          for kv in $EXPECT; do
+            k=${kv%%=*}; v=${kv#*=}; got=$(pb "$k" "$RUNNER_TEMP/ent-mac.plist")
+            if [ "$v" = "*" ]; then [ -n "$got" ] || { echo "::error::entitlement $k is missing"; exit 1; }
+            else [ "$got" = "$v" ] || { echo "::error::entitlement $k is '$got', expected '$v'"; exit 1; }; fi
+          done
+          echo "signature and entitlements as expected"
+
+      - name: Upload to App Store Connect
+        if: inputs.deploy
+        run: fastlane mac_upload bundle:${{ env.CFG_BUNDLE }} pkg:"$pkg"
+
+  mac_submit:
+    needs: [plan, mac]
+    if: inputs.deploy && inputs.submit && needs.mac.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          APPS: ${{ secrets.A_APPS }}
+          APP: ${{ inputs.app }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apps = json.loads(os.environ["APPS"])
+          app = os.environ["APP"]
+          if app not in apps:
+              raise SystemExit("unknown app")
+          cfg = apps[app]
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+              if "root" in cfg and "dir" in cfg:
+                  env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
+              if "android_dest" in cfg:
+                  env.write("DEST=%s\n" % cfg["android_dest"])
+          PY
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.A_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PRIVATE_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: ${{ env.CFG_ROOT }}/changelogs
+          sparse-checkout-cone-mode: true
+
+      - name: Release notes
+        run: |
+          base="src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}"
+          notes="$base.md"; [ -f "$base-mac.md" ] && notes="$base-mac.md"
+          python3 scripts/release_notes.py "$notes" "$RUNNER_TEMP/notes"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: fastlane
+        run: gem install fastlane -v "$FASTLANE_VERSION" --no-document
+
+      - name: Wait for Apple's processing, then submit or hand to testers
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          APP_REVIEW_CONTACT_FIRST_NAME: ${{ secrets.APP_REVIEW_CONTACT_FIRST_NAME }}
+          APP_REVIEW_CONTACT_LAST_NAME: ${{ secrets.APP_REVIEW_CONTACT_LAST_NAME }}
+          APP_REVIEW_CONTACT_EMAIL: ${{ secrets.APP_REVIEW_CONTACT_EMAIL }}
+          APP_REVIEW_CONTACT_PHONE: ${{ secrets.APP_REVIEW_CONTACT_PHONE }}
+          DEST: ${{ env.CFG_APPLE_DEST }}
+          GROUPS: ${{ env.CFG_TESTFLIGHT_GROUPS }}
+        run: |
+          if [ "$DEST" = testflight ]; then
+            ruby scripts/testflight.rb MAC_OS "${{ env.CFG_BUNDLE }}" \
+              "${{ needs.mac.outputs.name }}" "${{ needs.mac.outputs.code }}" "$RUNNER_TEMP/notes/full.txt" "$GROUPS"
+          else
+            ruby scripts/submit.rb MAC_OS "${{ env.CFG_BUNDLE }}" \
+              "${{ needs.mac.outputs.name }}" "${{ needs.mac.outputs.code }}" "$RUNNER_TEMP/notes/full.txt"
+          fi

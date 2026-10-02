@@ -1,0 +1,159 @@
+name: windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: 'Comma-separated app keys'
+        required: true
+      ref:
+        description: 'Branch or commit of the private repository'
+        default: 'main'
+      publish:
+        description: 'Publish to the download pages'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - id: pick
+        env:
+          APPS: ${{ inputs.apps }}
+        run: |
+          n=$(printf '%s' "$APPS" | tr -d ' ' | tr ',' '\n' | grep -c .)
+          echo "matrix=$(jq -cn --argjson n "$n" '{include: [range(0; $n) | {i: .}]}')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Mask
+        shell: bash
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        shell: bash
+        env:
+          WIN: ${{ secrets.A_WIN }}
+          APPS: ${{ inputs.apps }}
+          I: ${{ matrix.i }}
+        run: |
+          app=$(printf '%s' "$APPS" | tr -d ' ' | tr ',' '\n' | grep . | sed -n "$((I + 1))p")
+          jq -er --arg a "$app" '.[$a] | to_entries[] | "CFG_\(.key | ascii_upcase)=\(.value)"' <<<"$WIN" >> "$GITHUB_ENV" || { echo "unknown app"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.A_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PRIVATE_REPO_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+            ${{ env.CFG_ROOT }}/packages
+          sparse-checkout-cone-mode: true
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.1
+          cache: true
+
+      - name: Resolve packages (lockfile only)
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        run: flutter build windows --release
+
+      - name: Bundle the Visual C++ runtime
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $crt) { throw "no MSVC redist found under $vs" }
+          Copy-Item "$($crt.FullName)\*.dll" build\windows\x64\runner\Release\
+
+      - name: Launch check
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        shell: pwsh
+        env:
+          EXE: ${{ env.CFG_EXE }}
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'smoke.log'
+          $env:JQ_SMOKE_LOG = $log
+          $p = Start-Process "build\windows\x64\runner\Release\$env:EXE" -PassThru
+          Start-Sleep -Seconds 40
+          $alive = -not $p.HasExited
+          if ($alive) { Stop-Process -Id $p.Id -Force } else { Write-Host "exit code: $($p.ExitCode)" }
+          if (Test-Path $log) { Get-Content $log } else { Write-Host '(no log: Dart never started)' }
+          if (-not $alive) { throw 'the app exited within 40 seconds of launch' }
+          if (-not (Test-Path $log)) { throw 'the app never reached main()' }
+
+      - name: Build the installer
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        shell: pwsh
+        env:
+          ISS: ${{ env.CFG_ISS }}
+        run: |
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          } else { $iscc = $iscc.Source }
+          $v = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([\d.]+)\+(\d+)').Matches[0].Groups
+          & $iscc "/DAppVersion=$($v[1].Value)" "/DBuildNumber=$($v[2].Value)" "windows\installer\$env:ISS"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          "$($v[1].Value)+$($v[2].Value)" | Out-File -Encoding ascii -NoNewline build\windows\installer\VERSION
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.i }}
+          path: |
+            ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}/build/windows/installer/*.exe
+            ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}/build/windows/installer/VERSION
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Publish to the download page
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        if: inputs.publish
+        shell: bash
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          UPLOAD: ${{ env.CFG_UPLOAD }}
+        run: |
+          set -euo pipefail
+          version=$(cat build/windows/installer/VERSION)
+          file=$(ls build/windows/installer/*.exe | head -1)
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          cmd="$UPLOAD $version"
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "$cmd" < "$file"
+          rm -f ~/.ssh/dl
+

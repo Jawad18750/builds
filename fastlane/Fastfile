@@ -1,0 +1,221 @@
+require "json"
+require "xcodeproj"
+
+default_platform(:ios)
+
+TEAM_ID = ENV.fetch("CFG_TEAM")
+
+CLOSED_VERSION_STATES = %w[
+  READY_FOR_SALE PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE PROCESSING_FOR_APP_STORE
+  REPLACED_WITH_NEW_VERSION REMOVED_FROM_SALE DEVELOPER_REMOVED_FROM_SALE
+].freeze
+
+def asc_key
+  @asc_key ||= app_store_connect_api_key(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    key_content: ENV.fetch("ASC_API_KEY_P8"),
+    duration: 1200,
+    in_house: false
+  )
+end
+
+def connect!
+  require "spaceship"
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    key: ENV.fetch("ASC_API_KEY_P8")
+  )
+end
+
+desc "Refuse a version or build number App Store Connect will not take, before the build"
+lane :preflight do |o|
+  connect!
+  app = Spaceship::ConnectAPI::App.find(o[:bundle]) || UI.user_error!("no app #{o[:bundle]}")
+  platform = (o[:platform] || "IOS").to_s
+  version = o[:version].to_s
+  build = o[:build].to_i
+  strict = o[:strict].to_s != "false"
+  refuse = lambda do |why|
+    strict ? UI.user_error!(why) : UI.important("#{why} (build only, so not refused)")
+  end
+  live = app.get_app_store_versions(filter: { versionString: version, platform: platform }).first
+  if live && CLOSED_VERSION_STATES.include?(live.app_store_state.to_s)
+    refuse.call("#{platform} #{version} is already #{live.app_store_state}: bump the version and push")
+  end
+  top = Spaceship::ConnectAPI::Build.all(app_id: app.id, sort: "-uploadedDate", limit: 20)
+                                    .select { |b| b.pre_release_version.nil? || b.pre_release_version.platform.to_s == platform }
+                                    .map { |b| b.version.to_i }.max.to_i
+  if build <= top
+    refuse.call("build #{build} is not above #{top}, already on App Store Connect: bump it and push")
+  else
+    UI.success("#{platform} #{version} (#{build}) is free on App Store Connect (highest build so far #{top})")
+  end
+end
+
+desc "Signing for the runner's archive: certificate, profiles, project settings, export options"
+lane :ios_signing do |o|
+  project_path = o[:project]
+  export_plist = o[:export_options]
+  targets = JSON.parse(ENV.fetch("IOS_TARGETS_JSON")) # {"Target name" => "bundle id"}
+
+  setup_ci
+  import_certificate(
+    certificate_path: ENV.fetch("IOS_CI_P12_PATH"),
+    certificate_password: ENV.fetch("IOS_CI_P12_PASSWORD"),
+    keychain_name: "fastlane_tmp_keychain",
+    keychain_password: ""
+  )
+
+  profiles = {}
+  targets.each do |target, bundle|
+    get_provisioning_profile(
+      api_key: asc_key,
+      app_identifier: bundle,
+      team_id: TEAM_ID,
+      cert_id: ENV.fetch("IOS_CI_CERT_ID"),
+      provisioning_name: "#{bundle} AppStore CI",
+      output_path: File.join(ENV.fetch("RUNNER_TEMP"), "profiles"),
+      filename: "#{bundle}.mobileprovision",
+      readonly: false,
+      skip_install: false
+    )
+    profiles[target] = { bundle: bundle, name: lane_context[SharedValues::SIGH_NAME] }
+  end
+
+  project = Xcodeproj::Project.open(project_path)
+  project.build_configurations.select { |c| c.name == "Release" }.each do |c|
+    c.build_settings.keys.grep(/\ACODE_SIGN_IDENTITY/).each do |k|
+      c.build_settings[k] = "Apple Distribution"
+    end
+  end
+  attributes = (project.root_object.attributes["TargetAttributes"] ||= {})
+  project.targets.each do |t|
+    p = profiles[t.name]
+    next unless p
+    t.build_configurations.select { |c| c.name == "Release" }.each do |c|
+      s = c.build_settings
+      s["CODE_SIGN_STYLE"] = "Manual"
+      s["DEVELOPMENT_TEAM"] = TEAM_ID
+      s["CODE_SIGN_IDENTITY"] = "Apple Distribution"
+      %w[iphoneos watchos].each { |sdk| s["CODE_SIGN_IDENTITY[sdk=#{sdk}*]"] = "Apple Distribution" }
+      s["PROVISIONING_PROFILE_SPECIFIER"] = p[:name]
+      s.delete("PROVISIONING_PROFILE")
+    end
+    (attributes[t.uuid] ||= {})["ProvisioningStyle"] = "Manual"
+  end
+  missing = targets.keys - project.targets.map(&:name)
+  UI.user_error!("no target named #{missing.join(', ')} in #{project_path}") unless missing.empty?
+  project.save
+
+  mapping = profiles.values.map { |p| "<key>#{p[:bundle]}</key><string>#{p[:name]}</string>" }.join
+  File.write(export_plist, <<~PLIST)
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>method</key><string>app-store-connect</string>
+      <key>teamID</key><string>#{TEAM_ID}</string>
+      <key>signingStyle</key><string>manual</string>
+      <key>signingCertificate</key><string>Apple Distribution</string>
+      <key>provisioningProfiles</key><dict>#{mapping}</dict>
+      <key>destination</key><string>export</string>
+      <key>stripSwiftSymbols</key><true/>
+      <key>uploadSymbols</key><true/>
+    </dict>
+    </plist>
+  PLIST
+  UI.success("Signing ready: #{profiles.size} profiles")
+end
+
+desc "Signing for the Mac archive: both certificates, the Mac App Store profile, export options"
+lane :mac_signing do |o|
+  project_path = o[:project]
+  export_plist = o[:export_options]
+  bundle = o[:bundle]
+
+  setup_ci
+  import_certificate(
+    certificate_path: ENV.fetch("IOS_CI_P12_PATH"),
+    certificate_password: ENV.fetch("IOS_CI_P12_PASSWORD"),
+    keychain_name: "fastlane_tmp_keychain",
+    keychain_password: ""
+  )
+  import_certificate(
+    certificate_path: ENV.fetch("MAC_INSTALLER_P12_PATH"),
+    certificate_password: ENV.fetch("MAC_INSTALLER_P12_PASSWORD"),
+    keychain_name: "fastlane_tmp_keychain",
+    keychain_password: ""
+  )
+  get_provisioning_profile(
+    api_key: asc_key,
+    platform: "macos",
+    app_identifier: bundle,
+    team_id: TEAM_ID,
+    cert_id: ENV.fetch("IOS_CI_CERT_ID"),
+    provisioning_name: "#{bundle} MacAppStore CI",
+    output_path: File.join(ENV.fetch("RUNNER_TEMP"), "profiles"),
+    filename: "#{bundle}_mac.mobileprovision",
+    readonly: false,
+    skip_install: false
+  )
+  name = lane_context[SharedValues::SIGH_NAME]
+
+  project = Xcodeproj::Project.open(project_path)
+  project.build_configurations.select { |c| c.name == "Release" }.each do |c|
+    c.build_settings.keys.grep(/\ACODE_SIGN_IDENTITY/).each { |k| c.build_settings[k] = "Apple Distribution" }
+  end
+  runner = project.targets.find { |t| t.name == "Runner" } || UI.user_error!("no Runner target in #{project_path}")
+  runner.build_configurations.select { |c| c.name == "Release" }.each do |c|
+    s = c.build_settings
+    s["CODE_SIGN_STYLE"] = "Manual"
+    s["DEVELOPMENT_TEAM"] = TEAM_ID
+    s["CODE_SIGN_IDENTITY"] = "Apple Distribution"
+    s["CODE_SIGN_IDENTITY[sdk=macosx*]"] = "Apple Distribution"
+    s["PROVISIONING_PROFILE_SPECIFIER"] = name
+    s.delete("PROVISIONING_PROFILE")
+  end
+  project.save
+
+  File.write(export_plist, <<~PLIST)
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>method</key><string>app-store-connect</string>
+      <key>teamID</key><string>#{TEAM_ID}</string>
+      <key>signingStyle</key><string>manual</string>
+      <key>signingCertificate</key><string>Apple Distribution</string>
+      <key>installerSigningCertificate</key><string>3rd Party Mac Developer Installer</string>
+      <key>provisioningProfiles</key><dict><key>#{bundle}</key><string>#{name}</string></dict>
+      <key>destination</key><string>export</string>
+      <key>uploadSymbols</key><true/>
+    </dict>
+    </plist>
+  PLIST
+  UI.success("Mac signing ready: #{name}")
+end
+
+desc "Upload the Mac .pkg to App Store Connect; the submit job waits for Apple's processing"
+lane :mac_upload do |o|
+  upload_to_testflight(
+    api_key: asc_key,
+    app_identifier: o[:bundle],
+    pkg: o[:pkg],
+    app_platform: "osx",
+    skip_submission: true,
+    skip_waiting_for_build_processing: true
+  )
+end
+
+desc "Upload the ipa to App Store Connect; the submit job waits for Apple's processing"
+lane :ios_upload do |o|
+  upload_to_testflight(
+    api_key: asc_key,
+    app_identifier: o[:bundle],
+    ipa: o[:ipa],
+    skip_submission: true,
+    skip_waiting_for_build_processing: true
+  )
+end

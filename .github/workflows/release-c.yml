@@ -1,0 +1,337 @@
+name: release-c
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App
+        type: choice
+        options: [customer, driver, seller]
+        default: customer
+      platforms:
+        description: Platforms
+        type: choice
+        options: [both, android, ios]
+        default: both
+      ref:
+        description: Branch or commit
+        default: main
+      version:
+        description: Marketing version, e.g. 2.0.2 (empty = the one in fastlane/Fastfile)
+        type: string
+        required: false
+      android_track:
+        description: Google Play track, customer app only (production is a 100% rollout)
+        type: choice
+        options: [production, internal]
+        default: production
+      ios_submit:
+        description: Submit the iOS build to App Store review, replacing any version waiting there; it releases on approval
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-c-${{ inputs.app }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
+  FASTLANE_SKIP_UPDATE_CHECK: "1"
+  FASTLANE_HIDE_CHANGELOG: "1"
+  LANG: en_US.UTF-8
+  LC_ALL: en_US.UTF-8
+
+jobs:
+  android:
+    if: inputs.platforms != 'ios'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: Lanes
+        env:
+          PREFIX: ${{ secrets.C_ENV }}
+        run: echo "LANES_ENV=$PREFIX" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.C_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.C_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: |
+            apps/${{ inputs.app }}-app
+            fastlane
+            keystores
+          sparse-checkout-cone-mode: true
+
+      - name: Room on the disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h / | tail -1
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.1"
+          channel: stable
+          cache: true
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          working-directory: src
+
+      - name: Signing and store keys
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          PLAY_JSON: ${{ secrets.C_PLAY_JSON }}
+          KEY_PROPERTIES: ${{ secrets[format('C_ANDROID_KEY_PROPERTIES_{0}', inputs.app)] }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          test -n "$PLAY_JSON" && test -n "$KEY_PROPERTIES" ||
+            { echo "::error::the secrets are not set (setup)"; exit 1; }
+          mkdir -p secrets
+          printf '%s\n' "$ASC_API_KEY_P8" > secrets/AuthKey_${ASC_KEY_ID}.p8
+          printf '%s' "$PLAY_JSON" > secrets/google-play-service-account.json
+          {
+            printf '%s\n' "$KEY_PROPERTIES"
+            echo "storeFile=$GITHUB_WORKSPACE/src/keystores/$(cd "$GITHUB_WORKSPACE/src/keystores" && ls *_${{ inputs.app }}.keystore | head -1)"
+          } > "apps/${{ inputs.app }}-app/android/key.properties"
+          {
+            echo "${LANES_ENV}_ROOT=$GITHUB_WORKSPACE/src"
+            echo "${LANES_ENV}_SECRETS=$GITHUB_WORKSPACE/src/secrets"
+            echo "FLUTTER=$(command -v flutter)"
+          } >> "$GITHUB_ENV"
+
+      - name: Gradle within this machine's memory
+        run: |
+          mkdir -p ~/.gradle
+          {
+            echo "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:ReservedCodeCacheSize=256m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+            echo "org.gradle.workers.max=3"
+            echo "kotlin.compiler.execution.strategy=in-process"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Build, and for the customer app upload to Google Play
+        id: ship
+        working-directory: src
+        run: bundle exec fastlane ci_android app:${{ inputs.app }} track:${{ inputs.android_track }}
+
+      - name: Refuse an APK not signed with the release key
+        if: inputs.app != 'customer'
+        run: |
+          set -euo pipefail
+          signer="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+          "$signer" verify --print-certs "${{ steps.ship.outputs.apk }}" > "$RUNNER_TEMP/signer.txt"
+          if grep -q "Android Debug" "$RUNNER_TEMP/signer.txt"; then
+            echo "::error::the APK is debug-signed"
+            exit 1
+          fi
+          echo "signed with a release key"
+
+      - name: Publish the APK
+        if: inputs.app != 'customer'
+        env:
+          KEY: ${{ secrets.C_APK_SSH_KEY }}
+          KNOWN: ${{ secrets.C_APK_KNOWN_HOSTS }}
+          HOST: ${{ secrets.C_APK_HOST }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.ship.outputs.version }}
+          BUILD: ${{ steps.ship.outputs.build }}
+          APK: ${{ steps.ship.outputs.apk }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          test -n "$KEY" && test -n "$KNOWN" && test -n "$HOST" ||
+            { echo "::error::the APK publishing key is not set (setup)"; exit 1; }
+          notes=$(python3 - "fastlane/metadata/$APP/ar-SA/release_notes.txt" <<'PY' | base64 -w0
+          import json, pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          print(json.dumps({"ar": p.read_text().strip() if p.exists() else "", "en": ""}, ensure_ascii=False))
+          PY
+          )
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/apk && chmod 600 ~/.ssh/apk
+          printf '%s\n' "$KNOWN" > ~/.ssh/apk_known
+          ssh -i ~/.ssh/apk -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/apk_known "root@$HOST" "apk $APP $VERSION $BUILD $notes" < "$APK"
+          rm -f ~/.ssh/apk
+
+      - name: Clean up the keys
+        if: always()
+        run: rm -rf src/secrets src/apps/*/android/key.properties ~/.ssh/apk
+
+  ios:
+    if: inputs.platforms != 'android'
+    runs-on: macos-26
+    timeout-minutes: 90
+    outputs:
+      build: ${{ steps.prepare.outputs.build }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: Lanes
+        env:
+          PREFIX: ${{ secrets.C_ENV }}
+        run: echo "LANES_ENV=$PREFIX" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.C_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.C_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: |
+            apps/${{ inputs.app }}-app
+            fastlane
+          sparse-checkout-cone-mode: true
+
+      - name: Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.1"
+          channel: stable
+          cache: true
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          working-directory: src
+
+      - name: CocoaPods only, as on the release Mac
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: CocoaPods cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/apps/${{ inputs.app }}-app/ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-c-${{ inputs.app }}-${{ hashFiles(format('src/apps/{0}-app/ios/Podfile.lock', inputs.app)) }}
+
+      - name: Signing and store keys
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          PLAY_JSON: ${{ secrets.C_PLAY_JSON }}
+          IOS_CI_P12_BASE64: ${{ secrets.IOS_CI_P12_BASE64 }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p secrets
+          printf '%s\n' "$ASC_API_KEY_P8" > secrets/AuthKey_${ASC_KEY_ID}.p8
+          printf '%s' "$PLAY_JSON" > secrets/google-play-service-account.json
+          printf '%s' "$IOS_CI_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/ios_ci_distribution.p12"
+          {
+            echo "IOS_CI_P12_PATH=$RUNNER_TEMP/ios_ci_distribution.p12"
+            echo "${LANES_ENV}_ROOT=$GITHUB_WORKSPACE/src"
+            echo "${LANES_ENV}_SECRETS=$GITHUB_WORKSPACE/src/secrets"
+            echo "FLUTTER=$(command -v flutter)"
+          } >> "$GITHUB_ENV"
+
+      - name: Version check, build number and signing
+        id: prepare
+        env:
+          IOS_CI_P12_PASSWORD: ${{ secrets.IOS_CI_P12_PASSWORD }}
+          IOS_CI_CERT_ID: ${{ vars.IOS_CI_CERT_ID }}
+        working-directory: src
+        run: |
+          bundle exec fastlane ci_ios_prepare app:${{ inputs.app }}
+          rm -f "$IOS_CI_P12_PATH"
+
+      - name: Build the ipa
+        working-directory: src/apps/${{ inputs.app }}-app
+        run: |
+          pod --version
+          flutter build ipa --release \
+            --build-name="${{ steps.prepare.outputs.version }}" \
+            --build-number="${{ steps.prepare.outputs.build }}" \
+            --export-options-plist=ios/ExportOptions.manual.plist
+
+      - name: Upload to TestFlight
+        working-directory: src
+        run: bundle exec fastlane ci_ios_upload app:${{ inputs.app }}
+
+      - name: Clean up the keys
+        if: always()
+        run: rm -rf src/secrets "$RUNNER_TEMP/ios_ci_distribution.p12"
+
+  ios_submit:
+    needs: ios
+    if: inputs.ios_submit && needs.ios.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: Lanes
+        env:
+          PREFIX: ${{ secrets.C_ENV }}
+        run: echo "LANES_ENV=$PREFIX" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.C_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.C_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: fastlane
+          sparse-checkout-cone-mode: true
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          working-directory: src
+
+      - name: Store key
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p secrets
+          printf '%s\n' "$ASC_API_KEY_P8" > secrets/AuthKey_${ASC_KEY_ID}.p8
+          {
+            echo "${LANES_ENV}_ROOT=$GITHUB_WORKSPACE/src"
+            echo "${LANES_ENV}_SECRETS=$GITHUB_WORKSPACE/src/secrets"
+          } >> "$GITHUB_ENV"
+
+      - name: Wait for processing, then submit to App Store review
+        working-directory: src
+        run: bundle exec fastlane ci_submit_ios app:${{ inputs.app }} build:${{ needs.ios.outputs.build }}
+
+      - name: Clean up the key
+        if: always()
+        run: rm -rf src/secrets
