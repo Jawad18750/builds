@@ -1,0 +1,74 @@
+name: desktop-d
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit of the private repository'
+        default: 'main'
+      version:
+        description: 'Version to stamp on the build'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Mask
+        shell: bash
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.D_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.D_REPO_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the web workspaces
+        run: npm ci --no-audit --no-fund --workspace packages/core --workspace packages/data --workspace packages/paper --include-workspace-root
+
+      - name: Install the shell
+        working-directory: apps/desktop
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the web bundle
+        working-directory: apps/desktop
+        run: npm run web
+
+      - name: Package
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: npx electron-builder --win nsis --x64 --publish never -c.extraMetadata.version="$VERSION"
+
+      - name: Launch check
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist\win-unpacked\*.exe | Select-Object -First 1
+          $p = Start-Process $exe.FullName -PassThru
+          Start-Sleep -Seconds 30
+          if ($p.HasExited) { throw "the app exited within 30 seconds (code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: |
+            apps/desktop/dist/*.exe
+            apps/desktop/dist/*.blockmap
+            apps/desktop/dist/latest.yml
+          if-no-files-found: error
+          retention-days: 3
