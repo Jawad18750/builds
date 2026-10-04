@@ -1,0 +1,217 @@
+name: ios-d
+
+# An Expo (React Native) app: prebuild, CocoaPods, archive, export, upload to App Store
+# Connect. Handing the build to testers happens elsewhere, after Apple's processing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit of the private repository'
+        default: 'main'
+      build:
+        description: 'Build number (empty = the next one App Store Connect will take)'
+        required: false
+      deploy:
+        description: 'Upload (off = build, sign and check only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-d
+  cancel-in-progress: false
+
+env:
+  LANG: en_US.UTF-8
+  LC_ALL: en_US.UTF-8
+  FASTLANE_SKIP_UPDATE_CHECK: "1"
+  FASTLANE_HIDE_CHANGELOG: "1"
+  FASTLANE_HIDE_TIMESTAMP: "1"
+  FASTLANE_VERSION: "2.236.0"
+  COCOAPODS_VERSION: "1.17.0"
+  EXPO_NO_TELEMETRY: "1"
+  APP_DIR: src/apps/native
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 180
+    outputs:
+      build: ${{ steps.number.outputs.build }}
+      version: ${{ steps.number.outputs.version }}
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: App
+        env:
+          CFG: ${{ secrets.D_IOS }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          cfg = json.loads(os.environ["CFG"] or "{}")
+          if not cfg.get("bundle") or not cfg.get("team"):
+              raise SystemExit("the app configuration secret is not set (setup)")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              for key, value in cfg.items():
+                  env.write("CFG_%s=%s\n" % (key.upper(), value))
+          PY
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.D_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.D_REPO_KEY }}
+          persist-credentials: false
+          path: src
+
+      - name: Xcode
+        run: |
+          ls -d /Applications/Xcode_2*.app | xargs -n1 basename | tr '\n' ' '; echo
+          xcode=$(ls -d /Applications/Xcode_26*.app | grep -v -i beta | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: fastlane and CocoaPods
+        run: |
+          gem install fastlane -v "$FASTLANE_VERSION" --no-document
+          gem install cocoapods -v "$COCOAPODS_VERSION" --no-document
+          pod --version
+
+      - name: Install packages
+        working-directory: src
+        run: npm ci --no-audit --no-fund
+
+      - name: Store key
+        run: |
+          umask 077
+          printf '%s\n' "$ASC_API_KEY_P8" > "$RUNNER_TEMP/asc.p8"
+
+      - name: Build number
+        id: number
+        env:
+          WANTED: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          if [ -n "$WANTED" ]; then
+            n="$WANTED"
+          else
+            n=$(ASC_KEY_PATH="$RUNNER_TEMP/asc.p8" node "$APP_DIR/scripts/next-build.mjs" "$CFG_BUNDLE")
+          fi
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::no build number"; exit 1; }
+          node -e '
+            const fs = require("fs");
+            const [p, n] = process.argv.slice(1);
+            const d = JSON.parse(fs.readFileSync(p, "utf8"));
+            d.expo.ios.buildNumber = n;
+            fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
+          ' "$APP_DIR/app.json" "$n"
+          v=$(node -p 'require(process.argv[1]).expo.version' "$GITHUB_WORKSPACE/$APP_DIR/app.json")
+          echo "build=$n" >> "$GITHUB_OUTPUT"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version $v, build $n"
+
+      - name: Version and build on App Store Connect
+        run: fastlane preflight platform:IOS strict:${{ inputs.deploy }} bundle:"$CFG_BUNDLE" version:${{ steps.number.outputs.version }} build:${{ steps.number.outputs.build }}
+
+      - name: Native project
+        working-directory: ${{ env.APP_DIR }}
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: CocoaPods cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: pods-d-${{ hashFiles('src/package-lock.json') }}
+          restore-keys: pods-d-
+
+      - name: Pods
+        working-directory: ${{ env.APP_DIR }}/ios
+        run: pod install
+
+      - name: Signing
+        env:
+          IOS_CI_P12_BASE64: ${{ secrets.IOS_CI_P12_BASE64 }}
+          IOS_CI_P12_PASSWORD: ${{ secrets.IOS_CI_P12_PASSWORD }}
+          IOS_CI_CERT_ID: ${{ vars.IOS_CI_CERT_ID }}
+        run: |
+          set -euo pipefail
+          ws=$(ls -d "$APP_DIR"/ios/*.xcworkspace | head -1)
+          scheme=$(basename "$ws" .xcworkspace)
+          echo "SCHEME=$scheme" >> "$GITHUB_ENV"
+          export IOS_TARGETS_JSON=$(printf '{"%s":"%s"}' "$scheme" "$CFG_BUNDLE")
+          printf '%s' "$IOS_CI_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/ci.p12"
+          export IOS_CI_P12_PATH="$RUNNER_TEMP/ci.p12"
+          fastlane ios_signing project:"$GITHUB_WORKSPACE/$APP_DIR/ios/$scheme.xcodeproj" export_options:"$RUNNER_TEMP/ExportOptions.plist"
+          rm -f "$RUNNER_TEMP/ci.p12"
+
+      - name: Archive
+        working-directory: ${{ env.APP_DIR }}/ios
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -workspace "$SCHEME.xcworkspace" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -quiet 2>&1 | { grep -v -E '^ld: warning|: warning: ' || true; }
+          test -d "$RUNNER_TEMP/app.xcarchive/Products/Applications" || { echo "::error::no app in the archive"; exit 1; }
+
+      - name: Export
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Check the ipa
+        env:
+          BUILD: ${{ steps.number.outputs.build }}
+          VERSION: ${{ steps.number.outputs.version }}
+        run: |
+          set -euo pipefail
+          ipa=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
+          echo "ipa=$ipa" >> "$GITHUB_ENV"
+          rm -rf "$RUNNER_TEMP/ipa" && mkdir -p "$RUNNER_TEMP/ipa" && unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
+          app=$(ls -d "$RUNNER_TEMP"/ipa/Payload/*.app | head -1)
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$2" 2>/dev/null || true; }
+          short=$(pb CFBundleShortVersionString "$app/Info.plist")
+          build=$(pb CFBundleVersion "$app/Info.plist")
+          echo "ipa: $short ($build), $(du -h "$ipa" | cut -f1)"
+          [ "$short" = "$VERSION" ] && [ "$build" = "$BUILD" ] ||
+            { echo "::error::the ipa is $short ($build), expected $VERSION ($BUILD)"; exit 1; }
+          [ -f "$app/main.jsbundle" ] || { echo "::error::no JavaScript bundle in the app"; exit 1; }
+          codesign -d --entitlements :- "$app" 2>/dev/null > "$RUNNER_TEMP/ent.plist"
+          [ "$(pb aps-environment "$RUNNER_TEMP/ent.plist")" = production ] || { echo "::error::push entitlement is not production"; exit 1; }
+          [ -n "$(pb com.apple.developer.applesignin "$RUNNER_TEMP/ent.plist")" ] || { echo "::error::sign-in entitlement missing"; exit 1; }
+          echo "bundle and entitlements as expected"
+
+      - name: Upload to App Store Connect
+        if: inputs.deploy
+        run: fastlane ios_upload bundle:"$CFG_BUNDLE" ipa:"$ipa"
+
+      - name: Clean up the keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc.p8" "$RUNNER_TEMP/ci.p12" "$RUNNER_TEMP/profiles" "$RUNNER_TEMP/ipa" "$RUNNER_TEMP/export"
