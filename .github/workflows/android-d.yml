@@ -1,0 +1,208 @@
+name: android-d
+
+# An Expo (React Native) app as a release-signed APK for direct download: prebuild, Gradle,
+# a signature check against the release key, then (optionally) a launch on an emulator.
+# Nothing is uploaded anywhere but this run's artifact; publishing happens elsewhere.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit of the private repository'
+        default: 'main'
+      launch_check:
+        description: 'Start the APK on an emulator before accepting it'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-d
+  cancel-in-progress: false
+
+env:
+  EXPO_NO_TELEMETRY: "1"
+  APP_DIR: src/apps/native
+  ABIS: armeabi-v7a,arm64-v8a
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.describe.outputs.version }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - name: Room on the disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+          df -h / | tail -1
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.D_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.D_REPO_KEY }}
+          persist-credentials: false
+          path: src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          add-job-summary: never
+
+      - name: Gradle within this machine's memory
+        run: |
+          mkdir -p ~/.gradle
+          {
+            echo "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:ReservedCodeCacheSize=256m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+            echo "org.gradle.workers.max=4"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Install
+        working-directory: src
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate the native project
+        working-directory: ${{ env.APP_DIR }}
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Signing key
+        env:
+          KEYSTORE: ${{ secrets.D_ANDROID_KEYSTORE_BASE64 }}
+          PROPS: ${{ secrets.D_ANDROID_KEY_PROPERTIES }}
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE" && test -n "$PROPS" || { echo "::error::the signing secrets are not set (setup)"; exit 1; }
+          while IFS= read -r line; do
+            case "$line" in *Password=*) echo "::add-mask::${line#*=}" ;; esac
+          done <<< "$PROPS"
+          printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          { printf '%s\n' "$PROPS"; echo "storeFile=$RUNNER_TEMP/release.keystore"; } > key.properties
+          grep -q 'with-android-signing' app/build.gradle || { echo "::error::the release signing plugin did not run"; exit 1; }
+
+      - name: Build
+        working-directory: ${{ env.APP_DIR }}/android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures="$ABIS" --stacktrace
+
+      - name: Check the signature
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/release/app-release.apk
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          pass=$(sed -n 's/^storePassword=//p' key.properties | tr -d '\r')
+          alias=$(sed -n 's/^keyAlias=//p' key.properties | tr -d '\r')
+          want=$(keytool -list -v -keystore "$RUNNER_TEMP/release.keystore" -storepass "$pass" -alias "$alias" 2>/dev/null |
+            sed -n 's/.*SHA256: *//p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')
+          got=$("$bt/apksigner" verify --print-certs "$apk" 2>/dev/null |
+            sed -n 's/.*certificate SHA-256 digest: *//p' | head -1)
+          test -n "$want" && [ "$want" = "$got" ] || { echo "::error::the APK is not signed with the release key"; exit 1; }
+          echo "signed with the release key"
+
+      - name: Describe
+        id: describe
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/out/app-release.apk"
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          badge=$("$bt/aapt2" dump badging "$RUNNER_TEMP/out/app-release.apk" | head -1)
+          name=$(sed -nE "s/.*versionName='([^']+)'.*/\1/p" <<<"$badge")
+          code=$(sed -nE "s/.*versionCode='([0-9]+)'.*/\1/p" <<<"$badge")
+          sha=$(sha256sum "$RUNNER_TEMP/out/app-release.apk" | cut -d' ' -f1)
+          size=$(stat -c %s "$RUNNER_TEMP/out/app-release.apk")
+          printf '{"versionName":"%s","versionCode":%s,"sha256":"%s","size":%s}\n' "$name" "$code" "$sha" "$size" > "$RUNNER_TEMP/out/release.json"
+          echo "version=$name+$code" >> "$GITHUB_OUTPUT"
+          echo "version $name+$code, $((size / 1048576)) MB"
+
+      - name: Clean up the key
+        if: always()
+        working-directory: ${{ env.APP_DIR }}
+        run: rm -f android/key.properties "$RUNNER_TEMP/release.keystore"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 2
+
+  launch:
+    needs: build
+    if: inputs.launch_check
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: apk
+
+      - name: Hardware acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Launch script
+        run: |
+          cat > "$RUNNER_TEMP/launch.sh" <<'SH'
+          set -uo pipefail
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          pkg=$("$bt/aapt2" dump badging apk/app-release.apk | sed -nE "s/^package: name='([^']+)'.*/\1/p")
+          echo "abis: $(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+          adb install -r apk/app-release.apk || exit 1
+          adb logcat -c || true
+          adb shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+          sleep 60
+          mkdir -p screen
+          adb exec-out screencap -p > screen/launch.png || true
+          crashes=$(adb logcat -d -b crash 2>/dev/null)
+          if [ -z "$(adb shell pidof "$pkg" | tr -d '\r')" ] || grep -q 'FATAL EXCEPTION' <<<"$crashes"; then
+            echo "::error::the app is not running 60 seconds after launch"
+            printf '%s\n' "$crashes" | grep -vE '^-+ beginning of' | head -80
+            exit 1
+          fi
+          echo "still running 60 seconds after launch"
+          SH
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
+          disable-animations: true
+          script: bash "$RUNNER_TEMP/launch.sh"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screen
+          path: screen/
+          if-no-files-found: ignore
+          retention-days: 2
