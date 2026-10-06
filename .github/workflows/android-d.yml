@@ -211,10 +211,12 @@ jobs:
               key:*) adb shell input keyevent "${step#key:}"; sleep 1 ;;
               shot:*) adb exec-out screencap -p > "screen/${step#shot:}.png" ;;
               *) adb logcat -c || true
+                 # A sample-data link starts the app cold, so it is the app's first route.
+                 case "$step" in demo*) adb shell am force-stop "$pkg"; sleep 2 ;; esac
                  adb shell am start -W -a android.intent.action.VIEW -d "'$scheme:///${step#/}'" "$pkg" 2>&1 | grep -E 'Status|Activity' || true
                  sleep 6; n=$((n + 1)); adb exec-out screencap -p > "screen/$(printf '%02d' $n).png"
                  adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'mResumedActivity|topResumedActivity' || true
-                 adb logcat -d -s ReactNativeJS:V ReactNative:W 2>/dev/null | tail -15 || true ;;
+                 adb logcat -d '*:S' ReactNativeJS:V ReactNative:W ExpoModulesCore:W 2>/dev/null | tail -15 || true ;;
             esac
           done
           ls screen
