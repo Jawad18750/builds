@@ -14,6 +14,9 @@ on:
         description: 'Start the APK on an emulator before accepting it'
         type: boolean
         default: true
+      shots:
+        description: 'Screenshot mode: space-separated steps (a path to open, tap:X,Y, wait:S, key:CODE, shot:NAME). Builds a screenshots-only APK that is never published.'
+        default: ''
 
 permissions:
   contents: read
@@ -24,6 +27,9 @@ concurrency:
 
 env:
   EXPO_NO_TELEMETRY: "1"
+  # Screenshot builds open the app's sample data; an empty value leaves every other build untouched.
+  EXPO_PUBLIC_SHOTS: ${{ inputs.shots != '' && '1' || '' }}
+  APK_ARTIFACT: ${{ inputs.shots != '' && 'apk-shots' || 'apk' }}
   APP_DIR: src/apps/native
   ABIS: armeabi-v7a,arm64-v8a
 
@@ -141,14 +147,14 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: apk
+          name: ${{ env.APK_ARTIFACT }}
           path: ${{ runner.temp }}/out/
           if-no-files-found: error
           retention-days: 2
 
   launch:
     needs: build
-    if: inputs.launch_check
+    if: inputs.launch_check || inputs.shots != ''
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -159,7 +165,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: apk
+          name: ${{ env.APK_ARTIFACT }}
           path: apk
 
       - name: Hardware acceleration
@@ -188,6 +194,23 @@ jobs:
             exit 1
           fi
           echo "still running 60 seconds after launch"
+          [ -z "${SHOTS:-}" ] && exit 0
+          scheme=$("$bt/aapt2" dump xmltree --file AndroidManifest.xml apk/app-release.apk 2>/dev/null |
+            sed -nE 's/.*android:scheme.*="([^"]+)".*/\1/p' | grep -v -E '^(https?|exp\+.*)$' | head -1)
+          echo "::add-mask::$scheme"
+          [ -n "$scheme" ] || { echo "::error::no link scheme in the manifest"; exit 1; }
+          n=0
+          for step in $SHOTS; do
+            case "$step" in
+              tap:*) xy=${step#tap:}; adb shell input tap "${xy%,*}" "${xy#*,}"; sleep 2 ;;
+              wait:*) sleep "${step#wait:}" ;;
+              key:*) adb shell input keyevent "${step#key:}"; sleep 1 ;;
+              shot:*) adb exec-out screencap -p > "screen/${step#shot:}.png" ;;
+              *) adb shell am start -W -a android.intent.action.VIEW -d "$scheme://${step#/}" "$pkg" >/dev/null 2>&1
+                 sleep 6; n=$((n + 1)); adb exec-out screencap -p > "screen/$(printf '%02d' $n).png" ;;
+            esac
+          done
+          ls screen
           SH
 
       - uses: reactivecircus/android-emulator-runner@v2
@@ -195,9 +218,10 @@ jobs:
           api-level: 34
           target: google_apis
           arch: x86_64
+          profile: pixel_6
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
           disable-animations: true
-          script: bash "$RUNNER_TEMP/launch.sh"
+          script: SHOTS="${{ inputs.shots }}" bash "$RUNNER_TEMP/launch.sh"
 
       - uses: actions/upload-artifact@v4
         if: always()
