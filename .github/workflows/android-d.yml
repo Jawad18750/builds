@@ -195,8 +195,12 @@ jobs:
           fi
           echo "still running 60 seconds after launch"
           [ -z "${SHOTS:-}" ] && exit 0
-          scheme=$("$bt/aapt2" dump xmltree --file AndroidManifest.xml apk/app-release.apk 2>/dev/null |
-            sed -nE 's/.*android:scheme.*="([^"]+)".*/\1/p' | grep -v -E '^(https?|exp\+.*)$' | head -1)
+          # The app's own link scheme is the one Expo also registers as exp+<scheme>; the
+          # others (sign-in helpers, https) open some other activity.
+          schemes=$("$bt/aapt2" dump xmltree --file AndroidManifest.xml apk/app-release.apk 2>/dev/null |
+            sed -nE 's/.*android:scheme.*="([^"]+)".*/\1/p' | sort -u)
+          scheme=""
+          for s in $schemes; do grep -qx "exp+$s" <<<"$schemes" && scheme=$s && break; done
           echo "::add-mask::$scheme"
           [ -n "$scheme" ] || { echo "::error::no link scheme in the manifest"; exit 1; }
           n=0
