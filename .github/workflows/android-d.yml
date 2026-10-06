@@ -203,18 +203,23 @@ jobs:
           for s in $schemes; do grep -qx "exp+$s" <<<"$schemes" && scheme=$s && break; done
           echo "::add-mask::$scheme"
           [ -n "$scheme" ] || { echo "::error::no link scheme in the manifest"; exit 1; }
+          # The emulator's home screen hangs under load and covers everything with a
+          # "not responding" dialog; it is not needed once the app is open.
+          adb shell am force-stop com.google.android.apps.nexuslauncher 2>/dev/null || true
           n=0
           for step in $SHOTS; do
             case "$step" in
               tap:*) xy=${step#tap:}; adb shell input tap "${xy%,*}" "${xy#*,}"; sleep 2 ;;
               wait:*) sleep "${step#wait:}" ;;
               key:*) adb shell input keyevent "${step#key:}"; sleep 1 ;;
-              shot:*) adb exec-out screencap -p > "screen/${step#shot:}.png" ;;
+              shot:*) adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
+                 adb exec-out screencap -p > "screen/${step#shot:}.png" ;;
               *) adb logcat -c || true
                  # A sample-data link starts the app cold, so it is the app's first route.
                  case "$step" in demo*) adb shell am force-stop "$pkg"; sleep 2 ;; esac
                  adb shell am start -W -a android.intent.action.VIEW -d "'$scheme:///${step#/}'" "$pkg" 2>&1 | grep -E 'Status|Activity' || true
-                 sleep 6; n=$((n + 1)); adb exec-out screencap -p > "screen/$(printf '%02d' $n).png"
+                 sleep 6; adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
+                 sleep 1; n=$((n + 1)); adb exec-out screencap -p > "screen/$(printf '%02d' $n).png"
                  adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'mResumedActivity|topResumedActivity' || true
                  adb logcat -d '*:S' ReactNativeJS:V ReactNative:W ExpoModulesCore:W 2>/dev/null | tail -15 || true ;;
             esac
