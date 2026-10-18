@@ -2,6 +2,7 @@
 # release on approval.
 #
 #   ruby scripts/submit.rb <IOS|MAC_OS> <bundle id> <version> <build number> <release notes file>
+#   (SHOTS_DIR=<dir of locale folders> also replaces the store screenshots before submitting)
 #
 # Apple allows one open submission per app. One already waiting (or in review, or with
 # unresolved issues) is withdrawn first, and its version record, now editable again, is
@@ -104,6 +105,54 @@ abort "the version has no localizations" if locs.empty?
 locs.each do |loc|
   loc.update(attributes: { whatsNew: notes })
   puts "what's new set for #{loc.locale}"
+end
+
+# 3b. Store screenshots, only when this run made them: SHOTS_DIR holds <locale>/*.png. Each
+# display type found there (by pixel size) is replaced as a whole, in file-name order; types
+# that are not there are left as they are. Apple accepts screenshot changes only on an
+# editable version, which is why this happens here, after the record above and before submit.
+SLOTS = {
+  [2064, 2752] => "APP_IPAD_PRO_3GEN_129", [2048, 2732] => "APP_IPAD_PRO_3GEN_129",
+  [1320, 2868] => "APP_IPHONE_67", [1290, 2796] => "APP_IPHONE_67", [1260, 2736] => "APP_IPHONE_67",
+  [1206, 2622] => "APP_IPHONE_61", [1179, 2556] => "APP_IPHONE_61",
+  [1284, 2778] => "APP_IPHONE_65", [1242, 2688] => "APP_IPHONE_65",
+  [2880, 1800] => "APP_DESKTOP", [2560, 1600] => "APP_DESKTOP", [1440, 900] => "APP_DESKTOP", [1280, 800] => "APP_DESKTOP"
+}.freeze
+shots = ENV["SHOTS_DIR"].to_s
+if !shots.empty? && Dir.exist?(shots)
+  png_size = ->(path) { File.open(path, "rb") { |f| f.read(16); f.read(8).unpack("NN") } }
+  Dir.children(shots).sort.each do |locale|
+    files = Dir.glob(File.join(shots, locale, "*.png")).sort
+    next if files.empty?
+    loc = locs.find { |l| l.locale == locale }
+    unless loc
+      puts "no #{locale} localization: its screenshots are skipped"
+      next
+    end
+    by_slot = files.group_by do |f|
+      w, h = png_size.call(f)
+      SLOTS[[w, h]] || SLOTS[[h, w]] || abort("a #{w}x#{h} image is not an App Store screenshot size")
+    end
+    sets = loc.get_app_screenshot_sets
+    by_slot.each do |slot, list|
+      abort "#{slot}: #{list.size} images, the App Store takes at most 10" if list.size > 10
+      set = sets.find { |x| x.screenshot_display_type == slot } ||
+            loc.create_app_screenshot_set(attributes: { screenshotDisplayType: slot })
+      (set.app_screenshots || []).each(&:delete!)
+      ids = list.map { |f| Spaceship::ConnectAPI::AppScreenshot.create(app_screenshot_set_id: set.id, path: f).id }
+      set.reorder_screenshots(app_screenshot_ids: ids)
+      puts "#{locale} #{slot}: #{ids.size} screenshots"
+    end
+    # a submission with screenshots still processing is refused: wait for them
+    60.times do
+      states = loc.get_app_screenshot_sets.flat_map do |x|
+        (x.app_screenshots || []).map { |a| (a.asset_delivery_state || {})["state"].to_s }
+      end
+      abort "a screenshot failed Apple's processing" if states.include?("FAILED")
+      break if states.all? { |st| st == "COMPLETE" }
+      sleep 10
+    end
+  end
 end
 
 # 4. Submit: the ready submission Apple may already hold, or a new one.
