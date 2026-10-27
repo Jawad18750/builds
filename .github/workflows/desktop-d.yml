@@ -53,6 +53,8 @@ jobs:
 
       - name: Build the web bundle
         working-directory: apps/desktop
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: npm run web
 
       - name: Package
@@ -113,6 +115,8 @@ jobs:
 
       - name: Build the web bundle
         working-directory: apps/desktop
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: npm run web
 
       # With a Developer ID certificate in the secrets the app is signed and notarized;
