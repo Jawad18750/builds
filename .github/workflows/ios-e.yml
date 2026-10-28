@@ -148,7 +148,8 @@ jobs:
 
       - name: Pods
         working-directory: ${{ env.APP_DIR }}/ios
-        run: pod install
+        timeout-minutes: 25
+        run: pod install --verbose
 
       - name: Signing
         env:
