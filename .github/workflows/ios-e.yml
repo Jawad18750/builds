@@ -146,6 +146,23 @@ jobs:
           key: pods-e-${{ hashFiles('src/*/package-lock.json') }}
           restore-keys: pods-e-
 
+      - name: Prebuilt graphics libraries
+        working-directory: ${{ env.APP_DIR }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          root=node_modules/@shopify/react-native-skia
+          [ -d "$root" ] || exit 0
+          for platform in ios macos tvos; do
+            pkg="node_modules/react-native-skia-apple-$platform"
+            [ -d "$pkg/libs" ] || continue
+            start=$(date +%s)
+            rm -rf "$root/libs/$platform" && mkdir -p "$root/libs/$platform"
+            cp -R "$pkg"/libs/*.xcframework "$root/libs/$platform/"
+            node -p "require('./$pkg/package.json').version" > "$root/libs/$platform/.version"
+            echo "$platform: $(du -sh "$root/libs/$platform" | cut -f1) in $(( $(date +%s) - start ))s"
+          done
+
       - name: Pods
         working-directory: ${{ env.APP_DIR }}/ios
         timeout-minutes: 25
