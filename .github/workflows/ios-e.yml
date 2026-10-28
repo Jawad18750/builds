@@ -166,11 +166,7 @@ jobs:
       - name: Pods
         working-directory: ${{ env.APP_DIR }}/ios
         timeout-minutes: 25
-        run: |
-          ( while sleep 90; do echo "--- running:"; ps -A -o etime=,command= | grep -E 'node|ruby|pod|cp |curl|git|tar|xcrun|swift' | grep -v grep | cut -c1-200 | tail -12; done ) &
-          watcher=$!
-          pod install --verbose
-          kill $watcher 2>/dev/null || true
+        run: pod install
 
       - name: Signing
         env:
