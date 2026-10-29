@@ -1,0 +1,190 @@
+name: deploy-f
+
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: What to deploy
+        type: choice
+        options: [both, backend, dashboard]
+        default: both
+      environment:
+        description: Where (production waits for an approval)
+        type: choice
+        options: [staging, production]
+        default: staging
+      ref:
+        description: Branch, tag or commit
+        default: main
+      tests:
+        description: Run the test suites first
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-f-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.F_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.F_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      - name: The exact commit both jobs deploy
+        id: sha
+        run: echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  backend:
+    needs: resolve
+    if: inputs.part != 'dashboard'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: ${{ inputs.environment == 'production' && 'f-production' || 'f-staging' }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.F_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          ssh-key: ${{ secrets.F_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: backend
+          sparse-checkout-cone-mode: true
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, pdo_sqlite, sqlite3, gd, zip, intl, bcmath
+          coverage: none
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Install
+        working-directory: src/backend
+        run: |
+          composer install --no-interaction --prefer-dist --no-progress
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Tests
+        if: inputs.tests
+        working-directory: src/backend
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          php -d memory_limit=3G vendor/bin/phpunit
+
+      - name: SSH
+        env:
+          KEY: ${{ secrets.F_DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.F_DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.F_DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$KEY" && test -n "$KNOWN" && test -n "$HOST" || { echo "::error::the deploy secrets are not set (setup)"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          echo "TARGET=deploy@$HOST" >> "$GITHUB_ENV"
+
+      - name: Upload the Vite build and deploy
+        run: |
+          set -euo pipefail
+          dir=$(ssh "$TARGET" ci-deploy incoming)
+          rsync -az src/backend/public/build/ "$TARGET:$dir/"
+          ssh "$TARGET" ci-deploy backend "${{ inputs.environment }}" "${{ needs.resolve.outputs.sha }}" "$dir"
+
+      - name: Clean up the key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
+
+  dashboard:
+    needs: [resolve, backend]
+    # After the backend when both go out (the dashboard may need the new API), alone otherwise.
+    if: always() && inputs.part != 'backend' && needs.resolve.result == 'success' && (needs.backend.result == 'success' || needs.backend.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.environment == 'production' && 'f-production' || 'f-staging' }}
+    steps:
+      - name: Mask
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.F_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          ssh-key: ${{ secrets.F_REPO_KEY }}
+          persist-credentials: false
+          path: src
+          sparse-checkout: dashboard
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Install
+        working-directory: src/dashboard
+        run: npm ci --no-audit --no-fund
+
+      - name: Tests
+        if: inputs.tests
+        working-directory: src/dashboard
+        run: npx ng test --watch=false --browsers=ChromeHeadless
+
+      - name: Build for ${{ inputs.environment }}
+        working-directory: src/dashboard
+        run: npx ng build --configuration "${{ inputs.environment }}"
+
+      - name: SSH
+        env:
+          KEY: ${{ secrets.F_DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.F_DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.F_DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$KEY" && test -n "$KNOWN" && test -n "$HOST" || { echo "::error::the deploy secrets are not set (setup)"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          echo "TARGET=deploy@$HOST" >> "$GITHUB_ENV"
+
+      - name: Upload and deploy
+        run: |
+          set -euo pipefail
+          out=$(ls -d src/dashboard/dist/*/browser)
+          dir=$(ssh "$TARGET" ci-deploy incoming)
+          rsync -az "$out/" "$TARGET:$dir/"
+          ssh "$TARGET" ci-deploy dashboard "${{ inputs.environment }}" "${{ needs.resolve.outputs.sha }}" "$dir"
+
+      - name: Clean up the key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
