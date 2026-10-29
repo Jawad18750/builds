@@ -69,7 +69,7 @@ try:
             "releases": [{
                 "name": version_name,
                 "versionCodes": [str(code)],
-                "status": "completed",
+                "status": os.environ.get("PLAY_STATUS") or "completed",
                 "releaseNotes": [{"language": "ar", "text": notes}],
             }],
         },

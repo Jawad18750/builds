@@ -38,6 +38,10 @@ on:
         description: Also make the store images and replace them on the stores (with deploy)
         type: boolean
         default: false
+      play_draft:
+        description: Android as an app bundle on the Play track, saved as a draft release (a new store listing's first build)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -183,6 +187,7 @@ jobs:
       - name: App
         env:
           APPS: ${{ secrets.A_APPS }}
+          PLAY_DRAFT: ${{ inputs.play_draft }}
           APP: ${{ inputs.app }}
         run: |
           python3 - <<'PY'
@@ -199,6 +204,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if os.environ.get("PLAY_DRAFT") == "true":
+                  env.write("DEST=play\nPLAY_STATUS=draft\n")
           PY
 
       - uses: actions/checkout@v5
