@@ -14,6 +14,10 @@ on:
         description: 'Start the APK on an emulator before accepting it'
         type: boolean
         default: true
+      bundle:
+        description: 'Also build a store bundle (.aab) signed with the same key, as the artifact "aab"'
+        type: boolean
+        default: false
       shots:
         description: 'Screenshot mode: space-separated steps (a path to open, tap:X,Y, wait:S, key:CODE, shot:NAME). Builds a screenshots-only APK that is never published.'
         default: ''
@@ -139,6 +143,31 @@ jobs:
           printf '{"versionName":"%s","versionCode":%s,"sha256":"%s","size":%s}\n' "$name" "$code" "$sha" "$size" > "$RUNNER_TEMP/out/release.json"
           echo "version=$name+$code" >> "$GITHUB_OUTPUT"
           echo "version $name+$code, $((size / 1048576)) MB"
+
+      - name: Store bundle
+        if: inputs.bundle && inputs.shots == ''
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          set -euo pipefail
+          ./gradlew bundleRelease -PreactNativeArchitectures="$ABIS" --stacktrace
+          aab=app/build/outputs/bundle/release/app-release.aab
+          pass=$(sed -n 's/^storePassword=//p' key.properties | tr -d '\r')
+          alias=$(sed -n 's/^keyAlias=//p' key.properties | tr -d '\r')
+          want=$(keytool -list -v -keystore "$RUNNER_TEMP/release.keystore" -storepass "$pass" -alias "$alias" 2>/dev/null |
+            sed -n 's/.*SHA256: *//p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')
+          got=$(keytool -printcert -jarfile "$aab" 2>/dev/null | sed -n 's/.*SHA256: *//p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')
+          test -n "$want" && [ "$want" = "$got" ] || { echo "::error::the bundle is not signed with the release key"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/aab"
+          cp "$aab" "$RUNNER_TEMP/aab/app-release.aab"
+          echo "bundle signed with the release key, $(( $(stat -c %s "$aab") / 1048576 )) MB"
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.bundle && inputs.shots == ''
+        with:
+          name: aab
+          path: ${{ runner.temp }}/aab/
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Clean up the key
         if: always()
