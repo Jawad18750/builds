@@ -111,6 +111,8 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          # Some runner address ranges are dropped on the way to the server now and then.
+          printf 'Host *\n  ConnectTimeout 20\n  ConnectionAttempts 6\n  ServerAliveInterval 20\n' > ~/.ssh/config
           echo "TARGET=deploy@$HOST" >> "$GITHUB_ENV"
 
       - name: Upload the Vite build and deploy
@@ -175,6 +177,8 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          # Some runner address ranges are dropped on the way to the server now and then.
+          printf 'Host *\n  ConnectTimeout 20\n  ConnectionAttempts 6\n  ServerAliveInterval 20\n' > ~/.ssh/config
           echo "TARGET=deploy@$HOST" >> "$GITHUB_ENV"
 
       - name: Upload and deploy
