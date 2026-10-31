@@ -80,9 +80,34 @@ jobs:
         working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
         run: flutter pub get --enforce-lockfile
 
+      - name: Prepare content
+        if: env.CFG_CONTENT_LABEL != ''
+        shell: bash
+        env:
+          CONTENT_MASTER_KEY: ${{ secrets.A_CK }}
+        run: |
+          set -euo pipefail
+          tool="$CFG_ROOT/packages/content_crypto"
+          [ -f "$tool/bin/content_seal.dart" ] || { echo "this ref has no content step"; exit 0; }
+          echo "CONTENT_SEALED=1" >> "$GITHUB_ENV"
+          cd "$tool"
+          dart pub get --enforce-lockfile
+          dart run bin/content_seal.dart seal-assets --app "$GITHUB_WORKSPACE/$CFG_ROOT/$CFG_DIR" \
+            --key-id "rel.$CFG_CONTENT_LABEL.$GITHUB_RUN_NUMBER" --release \
+            --shares "$GITHUB_WORKSPACE/$CFG_ROOT/packages/content_protection" \
+            --platform windows
+
       - name: Build
         working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
         run: flutter build windows --release
+
+      - name: Check content
+        if: env.CONTENT_SEALED == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CFG_ROOT/packages/content_crypto"
+          dart run bin/content_seal.dart verify-build "$GITHUB_WORKSPACE/$CFG_ROOT/$CFG_DIR/build/windows/x64/runner/Release" --min-sealed "$CFG_CONTENT_MIN"
 
       - name: Bundle the Visual C++ runtime
         working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}

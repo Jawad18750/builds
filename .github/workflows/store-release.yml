@@ -280,6 +280,22 @@ jobs:
         run: |
           find "$PUB_CACHE/hosted/pub.dev" -path '*flutter_avif_android-*/android/src/main/java/*/FlutterAvifPlugin.java' -print -delete
 
+      - name: Prepare content
+        if: env.CFG_CONTENT_LABEL != ''
+        env:
+          CONTENT_MASTER_KEY: ${{ secrets.A_CK }}
+        run: |
+          set -euo pipefail
+          tool="src/$CFG_ROOT/packages/content_crypto"
+          [ -f "$tool/bin/content_seal.dart" ] || { echo "this ref has no content step"; exit 0; }
+          echo "CONTENT_SEALED=1" >> "$GITHUB_ENV"
+          cd "$tool"
+          dart pub get --enforce-lockfile
+          dart run bin/content_seal.dart seal-assets --app "$GITHUB_WORKSPACE/$APP_DIR" \
+            --key-id "rel.$CFG_CONTENT_LABEL.$GITHUB_RUN_NUMBER" --release \
+            --shares "$GITHUB_WORKSPACE/src/$CFG_ROOT/packages/content_protection" \
+            --platform android --android-cert "${CFG_ANDROID_CERT:-}"
+
       - name: Build
         id: build
         working-directory: ${{ env.APP_DIR }}
@@ -292,6 +308,15 @@ jobs:
             flutter build apk --release
             echo "artifact=$APP_DIR/build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Check content
+        if: env.CONTENT_SEALED == '1'
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          cd "src/$CFG_ROOT/packages/content_crypto"
+          dart run bin/content_seal.dart verify-build "$GITHUB_WORKSPACE/$ARTIFACT" --min-sealed "$CFG_CONTENT_MIN"
 
       - name: Refuse a build not signed with the upload key
         env:
@@ -457,11 +482,34 @@ jobs:
           fastlane ios_signing project:"$GITHUB_WORKSPACE/$APP_DIR/ios/Runner.xcodeproj" export_options:"$RUNNER_TEMP/ExportOptions.plist"
           rm -f "$RUNNER_TEMP/ci.p12"
 
+      - name: Prepare content
+        if: env.CFG_CONTENT_LABEL != ''
+        env:
+          CONTENT_MASTER_KEY: ${{ secrets.A_CK }}
+        run: |
+          set -euo pipefail
+          tool="src/$CFG_ROOT/packages/content_crypto"
+          [ -f "$tool/bin/content_seal.dart" ] || { echo "this ref has no content step"; exit 0; }
+          echo "CONTENT_SEALED=1" >> "$GITHUB_ENV"
+          cd "$tool"
+          dart pub get --enforce-lockfile
+          dart run bin/content_seal.dart seal-assets --app "$GITHUB_WORKSPACE/$APP_DIR" \
+            --key-id "rel.$CFG_CONTENT_LABEL.$GITHUB_RUN_NUMBER" --release \
+            --shares "$GITHUB_WORKSPACE/src/$CFG_ROOT/packages/content_protection" \
+            --platform ios
+
       - name: Build the ipa
         working-directory: ${{ env.APP_DIR }}
         run: |
           flutter pub get --enforce-lockfile
           flutter build ipa --release --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Check content
+        if: env.CONTENT_SEALED == '1'
+        run: |
+          set -euo pipefail
+          cd "src/$CFG_ROOT/packages/content_crypto"
+          dart run bin/content_seal.dart verify-build "$(ls "$GITHUB_WORKSPACE/$APP_DIR"/build/ios/ipa/*.ipa | head -1)" --min-sealed "$CFG_CONTENT_MIN"
 
       - name: Check the ipa
         env:
@@ -684,6 +732,22 @@ jobs:
           fastlane mac_signing bundle:${{ env.CFG_BUNDLE }} project:"$GITHUB_WORKSPACE/$APP_DIR/macos/Runner.xcodeproj" export_options:"$RUNNER_TEMP/ExportOptionsMac.plist"
           rm -f "$RUNNER_TEMP/ci.p12" "$RUNNER_TEMP/installer.p12"
 
+      - name: Prepare content
+        if: env.CFG_CONTENT_LABEL != ''
+        env:
+          CONTENT_MASTER_KEY: ${{ secrets.A_CK }}
+        run: |
+          set -euo pipefail
+          tool="src/$CFG_ROOT/packages/content_crypto"
+          [ -f "$tool/bin/content_seal.dart" ] || { echo "this ref has no content step"; exit 0; }
+          echo "CONTENT_SEALED=1" >> "$GITHUB_ENV"
+          cd "$tool"
+          dart pub get --enforce-lockfile
+          dart run bin/content_seal.dart seal-assets --app "$GITHUB_WORKSPACE/$APP_DIR" \
+            --key-id "rel.$CFG_CONTENT_LABEL.$GITHUB_RUN_NUMBER" --release \
+            --shares "$GITHUB_WORKSPACE/src/$CFG_ROOT/packages/content_protection" \
+            --platform macos
+
       - name: Build the pkg
         working-directory: ${{ env.APP_DIR }}
         run: |
@@ -694,6 +758,13 @@ jobs:
             -archivePath "$RUNNER_TEMP/mac.xcarchive" archive -quiet
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/mac.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptionsMac.plist" -exportPath "$RUNNER_TEMP/mac-export" -quiet
+
+      - name: Check content
+        if: env.CONTENT_SEALED == '1'
+        run: |
+          set -euo pipefail
+          cd "src/$CFG_ROOT/packages/content_crypto"
+          dart run bin/content_seal.dart verify-build "$GITHUB_WORKSPACE/$APP_DIR/build/macos/Build/Products/Release" --min-sealed "$CFG_CONTENT_MIN"
 
       - name: Check the pkg
         env:
