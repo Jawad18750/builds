@@ -178,7 +178,14 @@ jobs:
           ws=$(ls -d "$APP_DIR"/ios/*.xcworkspace | head -1)
           scheme=$(basename "$ws" .xcworkspace)
           echo "SCHEME=$scheme" >> "$GITHUB_ENV"
-          export IOS_TARGETS_JSON=$(printf '{"%s":"%s"}' "$scheme" "$CFG_BUNDLE")
+          # The app and each of its app extensions (widgets), each with its own bundle id and profile.
+          export IOS_TARGETS_JSON=$(ruby -rjson -rxcodeproj -e '
+            p = Xcodeproj::Project.open(ARGV[0]); t = { ARGV[1] => ARGV[2] }
+            p.targets.select { |x| x.respond_to?(:product_type) && x.product_type == "com.apple.product-type.app-extension" }.each do |x|
+              id = x.build_configurations.find { |c| c.name == "Release" }&.build_settings&.dig("PRODUCT_BUNDLE_IDENTIFIER")
+              t[x.name] = id if id && !id.include?("$")
+            end
+            print t.to_json' "$APP_DIR/ios/$scheme.xcodeproj" "$scheme" "$CFG_BUNDLE")
           printf '%s' "$IOS_CI_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/ci.p12"
           export IOS_CI_P12_PATH="$RUNNER_TEMP/ci.p12"
           fastlane ios_signing project:"$GITHUB_WORKSPACE/$APP_DIR/ios/$scheme.xcodeproj" export_options:"$RUNNER_TEMP/ExportOptions.plist"
