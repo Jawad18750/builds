@@ -185,7 +185,7 @@ jobs:
           set -euo pipefail
           test -n "$PLAY_JSON" || { echo "::error::D_PLAY_JSON is not set (setup)"; exit 1; }
           test -s "$NOTES" || { echo "::error::no release notes at the app's play_notes path"; exit 1; }
-          [ "$(wc -m < "$NOTES")" -le 500 ] || { echo "::error::the release notes are over 500 characters"; exit 1; }
+          [ "$(LC_ALL=C.UTF-8 wc -m < "$NOTES")" -le 500 ] || { echo "::error::the release notes are over 500 characters"; exit 1; }
           bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           badge=$("$bt/aapt2" dump badging "$RUNNER_TEMP/out/app-release.apk" | head -1)
           pkg=$(sed -nE "s/.*package: name='([^']+)'.*/\1/p" <<<"$badge")
