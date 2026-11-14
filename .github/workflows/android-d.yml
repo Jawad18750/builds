@@ -2,7 +2,8 @@ name: android-d
 
 # An Expo (React Native) app as a release-signed APK for direct download: prebuild, Gradle,
 # a signature check against the release key, then (optionally) a launch on an emulator.
-# Nothing is uploaded anywhere but this run's artifact; publishing happens elsewhere.
+# Nothing is uploaded anywhere but this run's artifact, except the bundle on a Play track when
+# play_track is set; the website APK is published elsewhere.
 
 on:
   workflow_dispatch:
@@ -18,6 +19,12 @@ on:
         description: 'Also build a store bundle (.aab) signed with the same key, as the artifact "aab"'
         type: boolean
         default: false
+      play_track:
+        description: 'Also release the bundle on this Google Play track (alpha = closed testing); empty = no Play'
+        default: ''
+      play_notes:
+        description: 'Release notes file (Arabic, at most 500 characters), relative to the app directory'
+        default: 'store/play-notes-ar.txt'
       shots:
         description: 'Screenshot mode: space-separated steps (a path to open, tap:X,Y, wait:S, key:CODE, shot:NAME). Builds a screenshots-only APK that is never published.'
         default: ''
@@ -145,7 +152,7 @@ jobs:
           echo "version $name+$code, $((size / 1048576)) MB"
 
       - name: Store bundle
-        if: inputs.bundle && inputs.shots == ''
+        if: (inputs.bundle || inputs.play_track != '') && inputs.shots == ''
         working-directory: ${{ env.APP_DIR }}/android
         run: |
           set -euo pipefail
@@ -161,8 +168,35 @@ jobs:
           cp "$aab" "$RUNNER_TEMP/aab/app-release.aab"
           echo "bundle signed with the release key, $(( $(stat -c %s "$aab") / 1048576 )) MB"
 
+      - uses: actions/checkout@v5
+        if: inputs.play_track != '' && inputs.shots == ''
+        with:
+          path: ci
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Release on Google Play
+        if: inputs.play_track != '' && inputs.shots == ''
+        env:
+          PLAY_JSON: ${{ secrets.D_PLAY_JSON }}
+          TRACK: ${{ inputs.play_track }}
+          NOTES: ${{ env.APP_DIR }}/${{ inputs.play_notes }}
+        run: |
+          set -euo pipefail
+          test -n "$PLAY_JSON" || { echo "::error::D_PLAY_JSON is not set (setup)"; exit 1; }
+          test -s "$NOTES" || { echo "::error::no release notes at the app's play_notes path"; exit 1; }
+          [ "$(wc -m < "$NOTES")" -le 500 ] || { echo "::error::the release notes are over 500 characters"; exit 1; }
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          badge=$("$bt/aapt2" dump badging "$RUNNER_TEMP/out/app-release.apk" | head -1)
+          pkg=$(sed -nE "s/.*package: name='([^']+)'.*/\1/p" <<<"$badge")
+          name=$(sed -nE "s/.*versionName='([^']+)'.*/\1/p" <<<"$badge")
+          code=$(sed -nE "s/.*versionCode='([0-9]+)'.*/\1/p" <<<"$badge")
+          echo "::add-mask::$pkg"
+          pip install --quiet google-api-python-client google-auth google-auth-httplib2
+          python3 ci/scripts/play_release.py "$pkg" "$RUNNER_TEMP/aab/app-release.aab" "$TRACK" "$name ($code)" "$code" "$NOTES"
+
       - uses: actions/upload-artifact@v4
-        if: inputs.bundle && inputs.shots == ''
+        if: (inputs.bundle || inputs.play_track != '') && inputs.shots == ''
         with:
           name: aab
           path: ${{ runner.temp }}/aab/
