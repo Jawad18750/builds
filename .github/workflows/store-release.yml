@@ -299,6 +299,8 @@ jobs:
       - name: Build
         id: build
         working-directory: ${{ env.APP_DIR }}
+        env:
+          APP_KEY: ${{ secrets[format('APP_KEY_{0}', env.CFG_SUFFIX)] }}
         run: |
           set -euo pipefail
           if [ "$DEST" = play ]; then
@@ -497,6 +499,14 @@ jobs:
             --key-id "rel.$CFG_CONTENT_LABEL.$GITHUB_RUN_NUMBER" --release \
             --shares "$GITHUB_WORKSPACE/src/$CFG_ROOT/packages/content_protection" \
             --platform ios
+
+      - name: App key
+        env:
+          APP_KEY: ${{ secrets[format('APP_KEY_{0}', env.CFG_SUFFIX)] }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_KEY" ]; then exit 0; fi
+          printf 'APP_KEY = %s\n' "$APP_KEY" > "$APP_DIR/ios/Flutter/Secrets.xcconfig"
 
       - name: Build the ipa
         working-directory: ${{ env.APP_DIR }}
