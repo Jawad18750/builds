@@ -137,7 +137,12 @@ jobs:
 
       - name: Native project
         working-directory: ${{ env.APP_DIR }}
-        run: npx expo prebuild --platform ios --no-install
+        env:
+          # An SDK's app key, under the build variable the app configuration names (sdk_env); none when unset.
+          SDK_KEY: ${{ secrets.E_SDK_KEY }}
+        run: |
+          if [ -n "$SDK_KEY" ] && [ -n "${CFG_SDK_ENV:-}" ]; then export "$CFG_SDK_ENV=$SDK_KEY"; fi
+          npx expo prebuild --platform ios --no-install
 
       - name: CocoaPods cache
         uses: actions/cache@v4
@@ -215,6 +220,7 @@ jobs:
         env:
           BUILD: ${{ steps.number.outputs.build }}
           VERSION: ${{ steps.number.outputs.version }}
+          HAS_SDK_KEY: ${{ secrets.E_SDK_KEY != '' && '1' || '' }}
         run: |
           set -euo pipefail
           ipa=$(ls "$RUNNER_TEMP"/export/*.ipa | head -1)
@@ -232,6 +238,11 @@ jobs:
           [ "$(pb aps-environment "$RUNNER_TEMP/ent.plist")" = production ] || { echo "::error::push entitlement is not production"; exit 1; }
           [ -n "$(pb com.apple.developer.applesignin "$RUNNER_TEMP/ent.plist")" ] || { echo "::error::sign-in entitlement missing"; exit 1; }
           echo "bundle and entitlements as expected"
+          # The SDK's app key reached the app when the build was given one (sdk_plist names the Info.plist entry).
+          if [ -n "$HAS_SDK_KEY" ] && [ -n "${CFG_SDK_PLIST:-}" ]; then
+            [ -n "$(pb "$CFG_SDK_PLIST" "$app/Info.plist")" ] || { echo "::error::SDK key missing from Info.plist"; exit 1; }
+            echo "SDK key present"
+          fi
 
       - name: Upload to App Store Connect
         if: inputs.deploy
