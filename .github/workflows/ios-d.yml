@@ -16,6 +16,9 @@ on:
         description: 'Upload (off = build, sign and check only)'
         type: boolean
         default: true
+      xcode:
+        description: 'Xcode version on the image, e.g. 27.1 (empty = the newest release)'
+        required: false
 
 permissions:
   contents: read
@@ -80,7 +83,7 @@ jobs:
       - name: Xcode
         run: |
           ls -d /Applications/Xcode_2*.app | xargs -n1 basename | tr '\n' ' '; echo
-          xcode=$(ls -d /Applications/Xcode_27*.app | grep -v -i beta | sort -V | tail -1)
+          if [ -n "${{ inputs.xcode }}" ]; then xcode="/Applications/Xcode_${{ inputs.xcode }}.app"; else xcode=$(ls -d /Applications/Xcode_27*.app | grep -v -i beta | sort -V | tail -1); fi
           sudo xcode-select -s "$xcode"
           xcodebuild -version
 
