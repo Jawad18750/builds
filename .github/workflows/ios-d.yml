@@ -37,7 +37,8 @@ env:
 
 jobs:
   ios:
-    runs-on: macos-26
+    # Xcode 27 (iOS 27 SDK): required for uploads from April 2027 (ITMS-90725). The xcode-27 image is the one that carries it.
+    runs-on: xcode-27
     timeout-minutes: 180
     outputs:
       build: ${{ steps.number.outputs.build }}
@@ -79,7 +80,7 @@ jobs:
       - name: Xcode
         run: |
           ls -d /Applications/Xcode_2*.app | xargs -n1 basename | tr '\n' ' '; echo
-          xcode=$(ls -d /Applications/Xcode_26*.app | grep -v -i beta | sort -V | tail -1)
+          xcode=$(ls -d /Applications/Xcode_27*.app | grep -v -i beta | sort -V | tail -1)
           sudo xcode-select -s "$xcode"
           xcodebuild -version
 
