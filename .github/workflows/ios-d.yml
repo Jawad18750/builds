@@ -171,12 +171,17 @@ jobs:
         working-directory: ${{ env.APP_DIR }}/ios
         run: |
           set -o pipefail
+          # Xcode 27 on the xcode-27 image: compiler processes died silently (memory) with full parallelism.
+          # Fewer jobs at once and no explicit-module scanning keep the archive inside the runner's memory.
+          echo "cores $(sysctl -n hw.ncpu), memory $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
           xcodebuild archive \
             -workspace "$SCHEME.xcworkspace" \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -jobs 2 \
+            SWIFT_ENABLE_EXPLICIT_MODULES=NO \
             -quiet 2>&1 | { grep -v -E '^ld: warning|: warning: ' || true; }
           test -d "$RUNNER_TEMP/app.xcarchive/Products/Applications" || { echo "::error::no app in the archive"; exit 1; }
 
