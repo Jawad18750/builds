@@ -86,6 +86,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
   shots:
@@ -120,6 +122,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
       - uses: actions/checkout@v5
@@ -204,6 +208,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
               if os.environ.get("PLAY_DRAFT") == "true":
                   env.write("DEST=play\nPLAY_STATUS=draft\n")
           PY
@@ -303,11 +309,16 @@ jobs:
           APP_KEY: ${{ secrets[format('APP_KEY_{0}', env.CFG_SUFFIX)] }}
         run: |
           set -euo pipefail
+          extra=()
+          if [ "${OBF:-}" = 1 ]; then
+            extra=(--obfuscate --split-debug-info="$RUNNER_TEMP/y" --extra-gen-snapshot-options=--save-obfuscation-map="$RUNNER_TEMP/y/obfuscation-map.json")
+            mkdir -p "$RUNNER_TEMP/y"
+          fi
           if [ "$DEST" = play ]; then
-            flutter build appbundle --release
+            flutter build appbundle --release ${extra[@]+"${extra[@]}"}
             echo "artifact=$APP_DIR/build/app/outputs/bundle/release/app-release.aab" >> "$GITHUB_OUTPUT"
           else
-            flutter build apk --release
+            flutter build apk --release ${extra[@]+"${extra[@]}"}
             echo "artifact=$APP_DIR/build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_OUTPUT"
           fi
 
@@ -352,6 +363,43 @@ jobs:
           raw=$(unzip -l "$ARTIFACT" | grep -c 'res/raw/' || true)
           echo "res/raw entries: $raw (at least $RAW_MIN)"
           [ "$raw" -ge "$RAW_MIN" ] || { echo "::error::R8 left $raw raw resources, expected at least $RAW_MIN"; exit 1; }
+
+      - name: Check the names
+        if: env.OBF == '1'
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          lib=$(unzip -Z1 "$ARTIFACT" | grep -E '(^|/)lib/arm64-v8a/libapp\.so$' | head -1)
+          unzip -p "$ARTIFACT" "$lib" > "$RUNNER_TEMP/aot.bin"
+          python3 scripts/aot_names.py "$RUNNER_TEMP/aot.bin" "$APP_DIR/lib" "src/$CFG_ROOT/packages"
+          rm -f "$RUNNER_TEMP/aot.bin"
+
+      - name: Keep the symbols
+        if: env.OBF == '1'
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.version.outputs.name }}+${{ steps.version.outputs.code }}
+          SEND: ${{ inputs.deploy }}
+        run: |
+          set -euo pipefail
+          n=$( (ls "$RUNNER_TEMP"/y/*.symbols 2>/dev/null || true) | wc -l | tr -d ' ')
+          [ "$n" -gt 0 ] || { echo "::error::no symbol files were written"; exit 1; }
+          (cd "$RUNNER_TEMP/y" && tar -czf ../y.tgz .)
+          rm -rf "$RUNNER_TEMP/y"
+          echo "symbol files: $n, packed $(du -h "$RUNNER_TEMP/y.tgz" | cut -f1)"
+          if [ "$SEND" != true ]; then echo "not sent: build only"; rm -f "$RUNNER_TEMP/y.tgz"; exit 0; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "sym $APP $VERSION android" < "$RUNNER_TEMP/y.tgz" |
+            sed -E 's/^kept [^:]*:/kept:/'
+          rm -f ~/.ssh/dl "$RUNNER_TEMP/y.tgz"
 
       - name: Release on Google Play
         if: inputs.deploy && env.DEST == 'play'
@@ -424,6 +472,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
       - uses: actions/checkout@v5
@@ -511,8 +561,14 @@ jobs:
       - name: Build the ipa
         working-directory: ${{ env.APP_DIR }}
         run: |
+          set -euo pipefail
+          extra=()
+          if [ "${OBF:-}" = 1 ]; then
+            extra=(--obfuscate --split-debug-info="$RUNNER_TEMP/y" --extra-gen-snapshot-options=--save-obfuscation-map="$RUNNER_TEMP/y/obfuscation-map.json")
+            mkdir -p "$RUNNER_TEMP/y"
+          fi
           flutter pub get --enforce-lockfile
-          flutter build ipa --release --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+          flutter build ipa --release ${extra[@]+"${extra[@]}"} --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
 
       - name: Check content
         if: env.CONTENT_SEALED == '1'
@@ -545,6 +601,36 @@ jobs:
           done
           for d in $EMBEDS; do [ -d "$app/$d" ] || { echo "::error::no $d in the app"; exit 1; }; done
           echo "entitlements and embedded bundles as expected"
+
+      - name: Check the names
+        if: env.OBF == '1'
+        run: python3 scripts/aot_names.py "$RUNNER_TEMP/ipa/Payload/Runner.app/Frameworks/App.framework/App" "$APP_DIR/lib" "src/$CFG_ROOT/packages"
+
+      - name: Keep the symbols
+        if: env.OBF == '1'
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.version.outputs.name }}+${{ steps.version.outputs.code }}
+          SEND: ${{ inputs.deploy }}
+        run: |
+          set -euo pipefail
+          n=$( (ls "$RUNNER_TEMP"/y/*.symbols 2>/dev/null || true) | wc -l | tr -d ' ')
+          [ "$n" -gt 0 ] || { echo "::error::no symbol files were written"; exit 1; }
+          (cd "$RUNNER_TEMP/y" && tar -czf ../y.tgz .)
+          rm -rf "$RUNNER_TEMP/y"
+          echo "symbol files: $n, packed $(du -h "$RUNNER_TEMP/y.tgz" | cut -f1)"
+          if [ "$SEND" != true ]; then echo "not sent: build only"; rm -f "$RUNNER_TEMP/y.tgz"; exit 0; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "sym $APP $VERSION ios" < "$RUNNER_TEMP/y.tgz" |
+            sed -E 's/^kept [^:]*:/kept:/'
+          rm -f ~/.ssh/dl "$RUNNER_TEMP/y.tgz"
 
       - name: Upload to App Store Connect
         if: inputs.deploy
@@ -580,6 +666,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
       - uses: actions/checkout@v5
@@ -679,6 +767,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
       - uses: actions/checkout@v5
@@ -762,8 +852,13 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
+          extra=()
+          if [ "${OBF:-}" = 1 ]; then
+            extra=(--obfuscate --split-debug-info="$RUNNER_TEMP/y" --extra-gen-snapshot-options=--save-obfuscation-map="$RUNNER_TEMP/y/obfuscation-map.json")
+            mkdir -p "$RUNNER_TEMP/y"
+          fi
           flutter pub get --enforce-lockfile
-          flutter build macos --release
+          flutter build macos --release ${extra[@]+"${extra[@]}"}
           xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Release \
             -archivePath "$RUNNER_TEMP/mac.xcarchive" archive -quiet
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/mac.xcarchive" \
@@ -803,6 +898,40 @@ jobs:
           done
           echo "signature and entitlements as expected"
 
+      - name: Check the names
+        if: env.OBF == '1'
+        run: |
+          set -euo pipefail
+          bin=$(find "$RUNNER_TEMP/pkg" -path '*/App.framework/Versions/A/App' -type f | head -1)
+          [ -n "$bin" ] || { echo "::error::no snapshot in the pkg"; exit 1; }
+          python3 scripts/aot_names.py "$bin" "$APP_DIR/lib" "src/$CFG_ROOT/packages"
+
+      - name: Keep the symbols
+        if: env.OBF == '1'
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.version.outputs.name }}+${{ steps.version.outputs.code }}
+          SEND: ${{ inputs.deploy }}
+        run: |
+          set -euo pipefail
+          n=$( (ls "$RUNNER_TEMP"/y/*.symbols 2>/dev/null || true) | wc -l | tr -d ' ')
+          [ "$n" -gt 0 ] || { echo "::error::no symbol files were written"; exit 1; }
+          (cd "$RUNNER_TEMP/y" && tar -czf ../y.tgz .)
+          rm -rf "$RUNNER_TEMP/y"
+          echo "symbol files: $n, packed $(du -h "$RUNNER_TEMP/y.tgz" | cut -f1)"
+          if [ "$SEND" != true ]; then echo "not sent: build only"; rm -f "$RUNNER_TEMP/y.tgz"; exit 0; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "sym $APP $VERSION macos" < "$RUNNER_TEMP/y.tgz" |
+            sed -E 's/^kept [^:]*:/kept:/'
+          rm -f ~/.ssh/dl "$RUNNER_TEMP/y.tgz"
+
       - name: Upload to App Store Connect
         if: inputs.deploy
         run: fastlane mac_upload bundle:${{ env.CFG_BUNDLE }} pkg:"$pkg"
@@ -837,6 +966,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
       - uses: actions/checkout@v5
@@ -932,6 +1063,8 @@ jobs:
                   env.write("APP_DIR=src/%s/%s\n" % (cfg["root"], cfg["dir"]))
               if "android_dest" in cfg:
                   env.write("DEST=%s\n" % cfg["android_dest"])
+              if cfg.get("obfuscate"):
+                  env.write("OBF=1\n")
           PY
 
       - uses: actions/checkout@v5

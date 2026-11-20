@@ -58,6 +58,8 @@ jobs:
         run: |
           app=$(printf '%s' "$APPS" | tr -d ' ' | tr ',' '\n' | grep . | sed -n "$((I + 1))p")
           jq -er --arg a "$app" '.[$a] | to_entries[] | "CFG_\(.key | ascii_upcase)=\(.value)"' <<<"$WIN" >> "$GITHUB_ENV" || { echo "unknown app"; exit 1; }
+          echo "APP=$app" >> "$GITHUB_ENV"
+          if [ "$(jq -r --arg a "$app" '.[$a].obfuscate // false' <<<"$WIN")" = true ]; then echo "OBF=1" >> "$GITHUB_ENV"; fi
 
       - uses: actions/checkout@v4
         with:
@@ -69,6 +71,11 @@ jobs:
             ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
             ${{ env.CFG_ROOT }}/packages
           sparse-checkout-cone-mode: true
+
+      - uses: actions/checkout@v4
+        if: env.OBF == '1'
+        with:
+          path: .w
 
       - uses: subosito/flutter-action@v2
         with:
@@ -99,7 +106,21 @@ jobs:
 
       - name: Build
         working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
-        run: flutter build windows --release
+        shell: bash
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ "${OBF:-}" = 1 ]; then
+            y="$RUNNER_TEMP/y"
+            mkdir -p "$y"
+            extra=(--obfuscate --split-debug-info="$y" --extra-gen-snapshot-options=--save-obfuscation-map="$y/obfuscation-map.json")
+          fi
+          flutter build windows --release ${extra[@]+"${extra[@]}"}
+
+      - name: Check the names
+        if: env.OBF == '1'
+        shell: bash
+        run: python .w/scripts/aot_names.py "$CFG_ROOT/$CFG_DIR/build/windows/x64/runner/Release/data/app.so" "$CFG_ROOT/$CFG_DIR/lib" "$CFG_ROOT/packages"
 
       - name: Check content
         if: env.CONTENT_SEALED == '1'
@@ -159,6 +180,34 @@ jobs:
             ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}/build/windows/installer/VERSION
           if-no-files-found: error
           retention-days: 2
+
+      - name: Keep the symbols
+        if: env.OBF == '1'
+        working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
+        shell: bash
+        env:
+          KEY: ${{ secrets.DL_SSH_KEY }}
+          KNOWN: ${{ secrets.DL_SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DL_SSH_HOST }}
+          USER: ${{ secrets.DL_SSH_USER }}
+          SEND: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          t=$(cygpath -u "$RUNNER_TEMP")
+          version=$(sed -nE 's/^version:[[:space:]]*([0-9.]+\+[0-9]+).*/\1/p' pubspec.yaml | head -1)
+          n=$( (ls "$t"/y/*.symbols 2>/dev/null || true) | wc -l | tr -d ' ')
+          [ "$n" -gt 0 ] || { echo "::error::no symbol files were written"; exit 1; }
+          (cd "$t/y" && tar -czf ../y.tgz .)
+          rm -rf "$t/y"
+          echo "symbol files: $n, packed $(du -h "$t/y.tgz" | cut -f1)"
+          if [ "$SEND" != true ]; then echo "not sent: build only"; rm -f "$t/y.tgz"; exit 0; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/dl && chmod 600 ~/.ssh/dl
+          printf '%s\n' "$KNOWN" > ~/.ssh/dl_known
+          ssh -i ~/.ssh/dl -o IdentitiesOnly=yes -o ConnectTimeout=20 \
+              -o UserKnownHostsFile=~/.ssh/dl_known "$USER@$HOST" "sym $APP $version windows" < "$t/y.tgz" |
+            sed -E 's/^kept [^:]*:/kept:/'
+          rm -f ~/.ssh/dl "$t/y.tgz"
 
       - name: Publish to the download page
         working-directory: ${{ env.CFG_ROOT }}/${{ env.CFG_DIR }}
