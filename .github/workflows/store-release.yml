@@ -46,6 +46,10 @@ on:
         description: Android test APK for the website, sealed for the upload key (Android alone, never the stores)
         type: boolean
         default: false
+      tv_build:
+        description: "With sideload: the small TV-only APK, with this build number (empty = off)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -70,6 +74,12 @@ jobs:
         if: inputs.sideload && (inputs.ios || inputs.mac || inputs.shots || inputs.play_draft)
         run: |
           echo "::error::sideload needs ios, mac, shots and play_draft off"
+          exit 1
+
+      - name: The TV build is a sideload
+        if: inputs.tv_build != '' && !(inputs.sideload && inputs.android)
+        run: |
+          echo "::error::tv_build needs sideload and android on"
           exit 1
 
       - name: Mask
@@ -192,6 +202,7 @@ jobs:
     if: inputs.android
     env:
       SIDELOAD: ${{ inputs.sideload }}
+      TV_BUILD: ${{ inputs.tv_build }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -248,6 +259,17 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h / | tail -1
 
+      - name: TV-only contents
+        if: env.TV_BUILD != ''
+        run: |
+          set -euo pipefail
+          [[ "$TV_BUILD" =~ ^[0-9]{1,6}$ ]] || { echo "::error::tv_build is a build number"; exit 1; }
+          trim="$APP_DIR/tool/tv_build/trim.py"
+          [ -f "$trim" ] || { echo "::error::this ref has no TV build"; exit 1; }
+          # before Version, which reads what this writes, and before the content is sealed
+          python3 "$trim" --build-number "$TV_BUILD"
+          echo "CFG_CONTENT_MIN=6" >> "$GITHUB_ENV"
+
       - name: Version
         id: version
         run: |
@@ -257,6 +279,7 @@ jobs:
           echo "$line"
 
       - name: Release notes
+        if: env.TV_BUILD == ''
         run: python3 scripts/release_notes.py "src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}.md" "$RUNNER_TEMP/notes"
 
       - uses: actions/setup-java@v5
@@ -342,6 +365,9 @@ jobs:
             flutter build appbundle --release ${extra[@]+"${extra[@]}"}
             echo "artifact=$APP_DIR/build/app/outputs/bundle/release/app-release.aab" >> "$GITHUB_OUTPUT"
           else
+            if [ -n "${TV_BUILD:-}" ]; then
+              extra+=(--target lib/main_tv.dart --target-platform android-arm --android-project-arg=tvOnly=true)
+            fi
             flutter build apk --release ${extra[@]+"${extra[@]}"}
             echo "artifact=$APP_DIR/build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_OUTPUT"
           fi
@@ -374,6 +400,19 @@ jobs:
           [ -n "$want" ] && [ "$want" = "$got" ] || { echo "::error::the build is not signed with the upload key"; exit 1; }
           ls -l "$ARTIFACT" | awk '{print "built:", $5, "bytes"}'
 
+      - name: The TV build is small, one ABI
+        if: env.TV_BUILD != ''
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          size=$(stat -c %s "$ARTIFACT")
+          [ "$size" -le 70000000 ] || { echo "::error::$size bytes, over 70 MB"; exit 1; }
+          abis=$(unzip -Z1 "$ARTIFACT" | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u)
+          [ "$abis" = armeabi-v7a ] || { echo "::error::not one 32-bit ABI"; exit 1; }
+          if unzip -Z1 "$ARTIFACT" | grep -E 'onnx|sherpa' > /dev/null; then echo "::error::the speech engine is in it"; exit 1; fi
+          echo "TV build: $size bytes"
+
       - name: What R8 kept
         env:
           ARTIFACT: ${{ steps.build.outputs.artifact }}
@@ -400,7 +439,9 @@ jobs:
           ARTIFACT: ${{ steps.build.outputs.artifact }}
         run: |
           set -euo pipefail
-          lib=$(unzip -Z1 "$ARTIFACT" | grep -E '(^|/)lib/arm64-v8a/libapp\.so$' | head -1)
+          abi=arm64-v8a
+          [ -z "${TV_BUILD:-}" ] || abi=armeabi-v7a
+          lib=$(unzip -Z1 "$ARTIFACT" | grep -E "(^|/)lib/$abi/libapp\.so\$" | head -1)
           unzip -p "$ARTIFACT" "$lib" > "$RUNNER_TEMP/aot.bin"
           python3 scripts/aot_names.py "$RUNNER_TEMP/aot.bin" "$APP_DIR/lib" "src/$CFG_ROOT/packages"
           rm -f "$RUNNER_TEMP/aot.bin"
