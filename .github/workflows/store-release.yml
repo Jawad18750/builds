@@ -42,6 +42,10 @@ on:
         description: Android as an app bundle on the Play track, saved as a draft release (a new store listing's first build)
         type: boolean
         default: false
+      sideload:
+        description: Android test APK for the website, sealed for the upload key (Android alone, never the stores)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,6 +66,12 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     steps:
+      - name: Sideload is Android alone
+        if: inputs.sideload && (inputs.ios || inputs.mac || inputs.shots || inputs.play_draft)
+        run: |
+          echo "::error::sideload needs ios, mac, shots and play_draft off"
+          exit 1
+
       - name: Mask
         env:
           MASK: ${{ secrets.MASK_WORDS }}
@@ -180,6 +190,8 @@ jobs:
   android:
     needs: plan
     if: inputs.android
+    env:
+      SIDELOAD: ${{ inputs.sideload }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -212,6 +224,8 @@ jobs:
                   env.write("OBF=1\n")
               if os.environ.get("PLAY_DRAFT") == "true":
                   env.write("DEST=play\nPLAY_STATUS=draft\n")
+              if os.environ.get("SIDELOAD") == "true":
+                  env.write("DEST=site_apk\n")
           PY
 
       - uses: actions/checkout@v5
@@ -277,6 +291,16 @@ jobs:
             printf '%s\n' "$KEY_PROPERTIES"
             echo "storeFile=$RUNNER_TEMP/upload.jks"
           } > "$APP_DIR/android/key.properties"
+          if [ "$SIDELOAD" = true ]; then
+            # A sideloaded APK runs under the upload key, so its content is sealed for that key.
+            pass=$(sed -n 's/^storePassword=//p' <<<"$KEY_PROPERTIES")
+            alias=$(sed -n 's/^keyAlias=//p' <<<"$KEY_PROPERTIES")
+            cert=$(keytool -list -v -keystore "$RUNNER_TEMP/upload.jks" -storepass "$pass" -alias "$alias" 2>/dev/null |
+              sed -n 's/^.*SHA256: //p' | head -1 | tr -d ': ' | tr 'A-F' 'a-f')
+            [ "${#cert}" = 64 ] || { echo "::error::no upload certificate"; exit 1; }
+            echo "::add-mask::$cert"
+            echo "CFG_ANDROID_CERT=$cert" >> "$GITHUB_ENV"
+          fi
 
       - name: Resolve packages
         working-directory: ${{ env.APP_DIR }}
@@ -360,7 +384,13 @@ jobs:
             unzip -p "$ARTIFACT" BUNDLE-METADATA/com.android.tools/r8.json 2>/dev/null |
               grep -oE '"(is[A-Za-z]*(Shrink|Optimiz)[A-Za-z]*|isSignatureKept|version)":[^,}]*' || true
           fi
-          raw=$(unzip -l "$ARTIFACT" | grep -c 'res/raw/' || true)
+          if [ "$DEST" = play ]; then
+            raw=$(unzip -l "$ARTIFACT" | grep -c 'res/raw/' || true)
+          else
+            # An APK shortens resource paths: count the table's entries.
+            aapt="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2"
+            raw=$("$aapt" dump resources "$ARTIFACT" | grep -cE '^ +resource 0x[0-9a-f]+ raw/' || true)
+          fi
           echo "res/raw entries: $raw (at least $RAW_MIN)"
           [ "$raw" -ge "$RAW_MIN" ] || { echo "::error::R8 left $raw raw resources, expected at least $RAW_MIN"; exit 1; }
 
