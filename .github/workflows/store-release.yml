@@ -28,7 +28,7 @@ on:
       play_track:
         description: Google Play track, for apps on Play (production is a 100% rollout)
         type: choice
-        options: [production, beta, alpha, internal]
+        options: [production, beta, alpha, internal, "tv:production"]
         default: production
       submit:
         description: After uploading, submit for App Store review or hand to TestFlight groups
@@ -47,7 +47,7 @@ on:
         type: boolean
         default: false
       tv_build:
-        description: "With sideload: the small TV-only APK, with this build number (empty = off)"
+        description: "The small TV-only build, with this build number: an APK with sideload, a bundle with play_track tv:production (empty = off)"
         type: string
         default: ""
 
@@ -76,10 +76,16 @@ jobs:
           echo "::error::sideload needs ios, mac, shots and play_draft off"
           exit 1
 
-      - name: The TV build is a sideload
-        if: inputs.tv_build != '' && !(inputs.sideload && inputs.android)
+      - name: The TV build is a sideload or the TV track, alone
+        if: inputs.tv_build != '' && !(inputs.android && !inputs.ios && !inputs.mac && !inputs.shots && (inputs.sideload || inputs.play_track == 'tv:production'))
         run: |
-          echo "::error::tv_build needs sideload and android on"
+          echo "::error::tv_build needs android alone, with sideload or play_track tv:production"
+          exit 1
+
+      - name: The TV track takes only the TV build
+        if: inputs.play_track == 'tv:production' && inputs.tv_build == ''
+        run: |
+          echo "::error::play_track tv:production needs tv_build"
           exit 1
 
       - name: Mask
@@ -279,12 +285,16 @@ jobs:
           echo "$line"
 
       - name: Release notes
-        if: env.TV_BUILD == ''
+        if: env.TV_BUILD == '' || env.DEST == 'play'
         run: |
           base="src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}"
           notes="$base.md"
           # An -android file is this platform's own text; the other stores keep the shared one.
-          if [ -f "$base-android.md" ]; then notes="$base-android.md"; fi
+          if [ -n "${TV_BUILD:-}" ]; then
+            notes="$base-tv.md"
+          elif [ -f "$base-android.md" ]; then
+            notes="$base-android.md"
+          fi
           python3 scripts/release_notes.py "$notes" "$RUNNER_TEMP/notes"
 
       - uses: actions/setup-java@v5
@@ -367,6 +377,10 @@ jobs:
             mkdir -p "$RUNNER_TEMP/y"
           fi
           if [ "$DEST" = play ]; then
+            if [ -n "${TV_BUILD:-}" ]; then
+              extra+=(--target lib/main_tv.dart --target-platform android-arm,android-arm64
+                --android-project-arg=tvOnly=true --android-project-arg=tvAbi=armeabi-v7a,arm64-v8a)
+            fi
             flutter build appbundle --release ${extra[@]+"${extra[@]}"}
             echo "artifact=$APP_DIR/build/app/outputs/bundle/release/app-release.aab" >> "$GITHUB_OUTPUT"
           else
@@ -405,8 +419,26 @@ jobs:
           [ -n "$want" ] && [ "$want" = "$got" ] || { echo "::error::the build is not signed with the upload key"; exit 1; }
           ls -l "$ARTIFACT" | awk '{print "built:", $5, "bytes"}'
 
+      - name: The TV bundle is small, two ABIs, 16 KB pages
+        if: env.TV_BUILD != '' && env.DEST == 'play'
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          abis=$(unzip -Z1 "$ARTIFACT" | sed -n 's#^base/lib/\([^/]*\)/.*#\1#p' | sort -u | paste -sd, -)
+          [ "$abis" = "arm64-v8a,armeabi-v7a" ] || { echo "::error::not the two ARM ABIs"; exit 1; }
+          if unzip -Z1 "$ARTIFACT" | grep -E '^base/lib/.*(onnx|sherpa)' > /dev/null; then echo "::error::the speech engine is in it"; exit 1; fi
+          d=$(mktemp -d)
+          unzip -q "$ARTIFACT" 'base/lib/arm64-v8a/*' -d "$d"
+          for so in "$d"/base/lib/arm64-v8a/*.so; do
+            for a in $(readelf -lW "$so" | awk '$1 == "LOAD" {print $NF}'); do
+              [ $((a)) -ge 16384 ] || { echo "::error::$(basename "$so") is not aligned for 16 KB pages"; exit 1; }
+            done
+          done
+          echo "TV bundle: $(stat -c %s "$ARTIFACT") bytes, two ABIs, 16 KB"
+
       - name: The TV build is small, one ABI
-        if: env.TV_BUILD != ''
+        if: env.TV_BUILD != '' && env.DEST != 'play'
         env:
           ARTIFACT: ${{ steps.build.outputs.artifact }}
         run: |
@@ -445,7 +477,7 @@ jobs:
         run: |
           set -euo pipefail
           abi=arm64-v8a
-          [ -z "${TV_BUILD:-}" ] || abi=armeabi-v7a
+          if [ -n "${TV_BUILD:-}" ] && [ "$DEST" != play ]; then abi=armeabi-v7a; fi
           lib=$(unzip -Z1 "$ARTIFACT" | grep -E "(^|/)lib/$abi/libapp\.so\$" | head -1)
           unzip -p "$ARTIFACT" "$lib" > "$RUNNER_TEMP/aot.bin"
           python3 scripts/aot_names.py "$RUNNER_TEMP/aot.bin" "$APP_DIR/lib" "src/$CFG_ROOT/packages"
