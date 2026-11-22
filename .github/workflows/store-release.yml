@@ -280,7 +280,12 @@ jobs:
 
       - name: Release notes
         if: env.TV_BUILD == ''
-        run: python3 scripts/release_notes.py "src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}.md" "$RUNNER_TEMP/notes"
+        run: |
+          base="src/${{ env.CFG_ROOT }}/changelogs/${{ env.CFG_CHANGELOG }}"
+          notes="$base.md"
+          # An -android file is this platform's own text; the other stores keep the shared one.
+          if [ -f "$base-android.md" ]; then notes="$base-android.md"; fi
+          python3 scripts/release_notes.py "$notes" "$RUNNER_TEMP/notes"
 
       - uses: actions/setup-java@v5
         with:
