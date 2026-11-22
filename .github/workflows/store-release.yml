@@ -515,9 +515,12 @@ jobs:
           PLAY_JSON: ${{ secrets.PLAY_JSON }}
         run: |
           pip install --quiet google-api-python-client google-auth google-auth-httplib2
+          track="${{ inputs.play_track }}"
+          # A television's opt-in wants the bundle on a testing track as well: one edit, no wait.
+          if [ "$track" = "tv:production" ]; then track="tv:internal,tv:production"; fi
           python3 scripts/play_release.py "${{ env.CFG_PACKAGE }}" \
             "${{ steps.build.outputs.artifact }}" \
-            "${{ inputs.play_track }}" "${{ steps.version.outputs.name }}" \
+            "$track" "${{ steps.version.outputs.name }}" \
             "${{ steps.version.outputs.code }}" "$RUNNER_TEMP/notes/play.txt"
 
       - name: Publish the APK on the website

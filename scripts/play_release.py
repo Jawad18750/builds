@@ -4,8 +4,8 @@
         <version code> <notes file>
 
 A code Play already holds (a retried run) is not uploaded again; otherwise the code Play reads
-out of the uploaded bundle must be the one expected. The track is set to that one
-code at 100% ("completed") with the notes in Arabic, and the edit is committed; Play then
+out of the uploaded bundle must be the one expected. <track> may name several, comma-separated.
+Each is set to that one code at 100% ("completed") with the notes in Arabic, and the edit is committed; Play then
 reviews it as usual. Prints codes and states only.
 """
 import json
@@ -62,18 +62,19 @@ try:
         if code != expected:
             sys.exit(f"Play read version code {code} from the bundle, expected {expected}")
 
-    edits.tracks().update(
-        packageName=package, editId=eid, track=track,
-        body={
-            "track": track,
-            "releases": [{
-                "name": version_name,
-                "versionCodes": [str(code)],
-                "status": os.environ.get("PLAY_STATUS") or "completed",
-                "releaseNotes": [{"language": "ar", "text": notes}],
-            }],
-        },
-    ).execute()
+    for one in track.split(","):
+        edits.tracks().update(
+            packageName=package, editId=eid, track=one,
+            body={
+                "track": one,
+                "releases": [{
+                    "name": version_name,
+                    "versionCodes": [str(code)],
+                    "status": os.environ.get("PLAY_STATUS") or "completed",
+                    "releaseNotes": [{"language": "ar", "text": notes}],
+                }],
+            },
+        ).execute()
     edits.commit(packageName=package, editId=eid).execute()
     print(f"{package} {version_name} ({code}) released on {track}")
 except Exception:
