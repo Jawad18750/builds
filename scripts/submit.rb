@@ -54,9 +54,26 @@ loop do
   sleep 60
 end
 
-# 2. The submission already open, withdrawn so this build takes its place.
+# Raw API calls for what Spaceship does not cover (asset library images in a submission).
+require "net/http"
+require "json"
+asc = lambda do |method, path, body = nil|
+  u = URI("https://api.appstoreconnect.apple.com#{path}")
+  r = Net::HTTP.const_get(method).new(u)
+  r["Authorization"] = "Bearer #{Spaceship::ConnectAPI.token.text}"
+  r["Content-Type"] = "application/json"
+  r.body = JSON.generate(body) if body
+  x = Net::HTTP.start(u.host, u.port, use_ssl: true) { |h| h.request(r) }
+  [x.code.to_i, (JSON.parse(x.body) rescue {})]
+end
+
+# 2. The submission already open, withdrawn so this build takes its place. Store images
+# (asset library) waiting in it are carried into the new submission, not dropped.
+carried = []
 if (open = app.get_in_progress_review_submission(platform: ios))
-  puts "withdrawing the open submission (#{open.state})"
+  _, items = asc.call(:Get, "/v1/reviewSubmissions/#{open.id}/items?limit=50")
+  carried = (items["data"] || []).filter_map { |i| i.dig("relationships", "appAssetLibraryImage", "data", "id") }
+  puts "withdrawing the open submission (#{open.state}), carrying #{carried.size} store image(s)"
   open.cancel_submission
   60.times do
     v = app.get_edit_app_store_version(platform: ios)
@@ -162,6 +179,17 @@ begin
 rescue StandardError => e
   # Already an item of this submission (a retried run): fine, anything else is not.
   raise unless e.message.to_s =~ /already|duplicate|exists/i
+end
+carried.each do |img|
+  code = nil
+  20.times do
+    code, = asc.call(:Post, "/v1/reviewSubmissionItems", { data: { type: "reviewSubmissionItems",
+      relationships: { reviewSubmission: { data: { type: "reviewSubmissions", id: submission.id } },
+                       appAssetLibraryImage: { data: { type: "appAssetLibraryImages", id: img } } } } })
+    break if [201, 409].include?(code)
+    sleep 15 # the withdrawn submission may still be letting go of it
+  end
+  puts(code == 201 ? "store image carried into this submission" : "::warning::a store image could not be carried (#{code}): submit it again by hand")
 end
 submission.submit_for_review
 puts "#{version} (#{build_number}) submitted for review, release on approval"
