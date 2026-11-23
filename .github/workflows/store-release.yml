@@ -1146,7 +1146,8 @@ jobs:
 
   play_images:
     needs: [plan, shots, android]
-    if: always() && inputs.shots && inputs.deploy && needs.shots.outputs.ready == 'true' && (needs.android.result == 'success' || needs.android.result == 'skipped')
+    # A run that leaves Android out but builds iOS or Mac leaves the Play listing alone too.
+    if: always() && inputs.shots && inputs.deploy && needs.shots.outputs.ready == 'true' && (needs.android.result == 'success' || (needs.android.result == 'skipped' && !inputs.ios && !inputs.mac))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
