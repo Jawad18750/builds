@@ -27,6 +27,10 @@ on:
         description: 'Print the whole archive log (to read a failing compile)'
         type: boolean
         default: false
+      jsi_probe:
+        description: 'Only build the ExpoModulesJSI device slice, verbose, then stop (diagnosis)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -161,6 +165,32 @@ jobs:
       - name: Pods
         working-directory: ${{ env.APP_DIR }}/ios
         run: pod install
+
+      - name: ExpoModulesJSI probe
+        if: ${{ inputs.jsi_probe }}
+        working-directory: src/node_modules/expo-modules-jsi/apple
+        run: |
+          echo "cores $(sysctl -n hw.ncpu), memory $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"; xcodebuild -version
+          sed -i '' 's/^    -quiet \\$/    -verbose \\/' scripts/build-xcframework.sh
+          grep -n -- '-verbose' scripts/build-xcframework.sh || true
+          rm -f Products/ExpoModulesJSI.xcframework/ios-arm64/.build-hash
+          set +e
+          PODS_ROOT="$GITHUB_WORKSPACE/$APP_DIR/ios/Pods" PLATFORM_NAME=iphoneos ./scripts/build-xcframework.sh > "$RUNNER_TEMP/jsi.log" 2>&1
+          echo "script exit $?"
+          grep -n -E "error:|exit code 0|BUILD (SUCCEEDED|FAILED)|Built xcframework|Detected" "$RUNNER_TEMP/jsi.log" | cut -c1-300
+          B=Products/ExpoModulesJSI.xcframework/ios-arm64/ExpoModulesJSI.framework/ExpoModulesJSI
+          ls -la "$B"; echo "swift symbols: $(nm -gU "$B" | grep -c s14ExpoModulesJSI)"
+          echo "--- around the first SwiftCompile failure"
+          n=$(grep -n "exit code 0" "$RUNNER_TEMP/jsi.log" | head -1 | cut -d: -f1)
+          [ -n "$n" ] && sed -n "$((n-60)),$((n+20))p" "$RUNNER_TEMP/jsi.log" | cut -c1-1500
+          echo "--- swift-frontend crash reports"
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i swift
+          for f in ~/Library/Logs/DiagnosticReports/swift-frontend*; do [ -f "$f" ] && head -80 "$f"; done
+          echo "--- the frontend command, run by hand"
+          cmd=$(grep -n -E "swift-frontend -frontend -c" "$RUNNER_TEMP/jsi.log" | grep ExpoModulesJSI | tail -1 | cut -d: -f2-)
+          echo "${cmd:0:600}"
+          echo "::error::probe only: no archive"
+          exit 1
 
       - name: Signing
         env:
