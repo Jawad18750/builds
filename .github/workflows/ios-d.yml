@@ -23,6 +23,10 @@ on:
         description: 'Runner image: xcode-27 (default) or macos-26 (Xcode 26)'
         required: false
         default: 'xcode-27'
+      verbose:
+        description: 'Print the whole archive log (to read a failing compile)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -189,7 +193,7 @@ jobs:
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
             -jobs 2 \
             SWIFT_ENABLE_EXPLICIT_MODULES=NO \
-            -quiet 2>&1 | { grep -v -E '^ld: warning|: warning: ' || true; }
+            $([ "${{ inputs.verbose }}" = "true" ] || echo -quiet) 2>&1 | { if [ "${{ inputs.verbose }}" = "true" ]; then cat; else grep -v -E '^ld: warning|: warning: ' || true; fi; }
           test -d "$RUNNER_TEMP/app.xcarchive/Products/Applications" || { echo "::error::no app in the archive"; exit 1; }
 
       - name: Export
