@@ -166,6 +166,20 @@ jobs:
         working-directory: ${{ env.APP_DIR }}/ios
         run: pod install
 
+      - name: ExpoModulesJSI slice
+        # Built here, alone, before the archive. Built inside the archive (Xcode 27 on the
+        # 3-core runner) its Swift compile dies silently and the app ships without the
+        # module's Swift code: build 72 crashed at launch. The archive's own phase then
+        # finds the slice up to date (same PODS_ROOT, RN_ROOT, toolchain) and skips it.
+        if: ${{ !inputs.jsi_probe }}
+        working-directory: src/node_modules/expo-modules-jsi/apple
+        run: |
+          rm -f Products/ExpoModulesJSI.xcframework/ios-arm64/.build-hash
+          PODS_ROOT="$GITHUB_WORKSPACE/$APP_DIR/ios/Pods" PLATFORM_NAME=iphoneos ./scripts/build-xcframework.sh
+          n=$(nm -gU Products/ExpoModulesJSI.xcframework/ios-arm64/ExpoModulesJSI.framework/ExpoModulesJSI | grep -c s14ExpoModulesJSI || true)
+          echo "ExpoModulesJSI swift symbols: $n"
+          [ "$n" -gt 100 ] || { echo "::error::ExpoModulesJSI slice has no Swift code"; exit 1; }
+
       - name: ExpoModulesJSI probe
         if: ${{ inputs.jsi_probe }}
         working-directory: src/node_modules/expo-modules-jsi/apple
@@ -225,6 +239,15 @@ jobs:
             SWIFT_ENABLE_EXPLICIT_MODULES=NO \
             $([ "${{ inputs.verbose }}" = "true" ] || echo -quiet) 2>&1 | { if [ "${{ inputs.verbose }}" = "true" ]; then cat; else grep -v -E '^ld: warning|: warning: ' || true; fi; }
           test -d "$RUNNER_TEMP/app.xcarchive/Products/Applications" || { echo "::error::no app in the archive"; exit 1; }
+          # The app must carry ExpoModulesJSI's Swift code (build 72 shipped without it and crashed at launch).
+          J=$(ls -d "$RUNNER_TEMP"/app.xcarchive/Products/Applications/*.app/Frameworks/ExpoModulesJSI.framework 2>/dev/null | head -1)
+          if [ -n "$J" ]; then
+            n=$(nm -gU "$J/ExpoModulesJSI" | grep -c s14ExpoModulesJSI || true)
+            echo "app ExpoModulesJSI swift symbols: $n"
+            [ "$n" -gt 100 ] || { echo "::error::the app's ExpoModulesJSI has no Swift code: it would crash at launch"; exit 1; }
+          else
+            echo "::warning::ExpoModulesJSI.framework not found in the app; the Swift-code check did not run"
+          fi
 
       - name: Export
         run: |
