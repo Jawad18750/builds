@@ -167,10 +167,11 @@ jobs:
         run: pod install
 
       - name: ExpoModulesJSI slice
-        # Built here, alone, before the archive. Built inside the archive (Xcode 27 on the
-        # 3-core runner) its Swift compile dies silently and the app ships without the
-        # module's Swift code: build 72 crashed at launch. The archive's own phase then
-        # finds the slice up to date (same PODS_ROOT, RN_ROOT, toolchain) and skips it.
+        # Built here, alone, before the archive. Inside an Xcode 27 archive this nested
+        # build prints a bogus "error: ... failed with exit code 0" line (an Xcode 27 -quiet
+        # quirk; the slice is complete) and Xcode fails the whole archive for it. Built
+        # first, the archive's own phase finds the slice up to date and skips it.
+        # (Build 72's launch crash was NOT this: it was the iOS 27 SDK's UIScene rule.)
         if: ${{ !inputs.jsi_probe }}
         working-directory: src/node_modules/expo-modules-jsi/apple
         run: |
@@ -239,7 +240,7 @@ jobs:
             SWIFT_ENABLE_EXPLICIT_MODULES=NO \
             $([ "${{ inputs.verbose }}" = "true" ] || echo -quiet) 2>&1 | { if [ "${{ inputs.verbose }}" = "true" ]; then cat; else grep -v -E '^ld: warning|: warning: ' || true; fi; }
           test -d "$RUNNER_TEMP/app.xcarchive/Products/Applications" || { echo "::error::no app in the archive"; exit 1; }
-          # The app must carry ExpoModulesJSI's Swift code (build 72 shipped without it and crashed at launch).
+          # The app must carry ExpoModulesJSI's Swift code (a safety net; it would crash at launch without it).
           J=$(ls -d "$RUNNER_TEMP"/app.xcarchive/Products/Applications/*.app/Frameworks/ExpoModulesJSI.framework 2>/dev/null | head -1)
           if [ -n "$J" ]; then
             n=$(nm -gU "$J/ExpoModulesJSI" | grep -c s14ExpoModulesJSI || true)
