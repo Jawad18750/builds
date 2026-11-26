@@ -20,7 +20,7 @@ on:
       win32:
         description: Windows 32-bit (its own update channel)
         type: boolean
-        default: false
+        default: true
       electron32:
         description: Electron for the 32-bit build (the last line that ships win32-ia32)
         default: '43.8.13'
