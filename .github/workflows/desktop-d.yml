@@ -24,6 +24,13 @@ on:
       electron32:
         description: Electron for the 32-bit build (the last line that ships win32-ia32)
         default: '43.8.13'
+      win7:
+        description: Windows 7/8 (older Electron, x64 + ia32 in one installer, its own update channel)
+        type: boolean
+        default: true
+      electron7:
+        description: Electron for the Windows 7/8 build (the last line that runs there)
+        default: '22.3.27'
 
 permissions:
   contents: read
@@ -173,6 +180,108 @@ jobs:
             apps/desktop/dist/*.exe
             apps/desktop/dist/*.blockmap
             apps/desktop/dist/ia32.yml
+          if-no-files-found: error
+          retention-days: 3
+
+  build7:
+    if: inputs.win7
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Mask
+        shell: bash
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.D_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.D_REPO_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the web workspaces
+        run: npm ci --no-audit --no-fund --workspace packages/core --workspace packages/data --workspace packages/paper --include-workspace-root
+
+      # The older Electron's Node has no fetch: the shell fills it in from undici 5 (the
+      # last line for that Node), added here so the other builds never carry it.
+      - name: Install the shell
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npm install --no-audit --no-fund --save-exact undici@5.29.0
+
+      - name: Build the web bundle
+        working-directory: apps/desktop
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: npm run web
+
+      # The bundle's stylesheets, lowered for the older browser engine.
+      - name: Lower the stylesheets
+        working-directory: apps/desktop
+        run: node scripts/legacy-css.mjs web
+
+      - name: The Windows 7 config
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          ELECTRON7: ${{ inputs.electron7 }}
+        # The package's own build config, changed only where this build differs: both arches in
+        # one installer, a «-win7» file name, the older Electron, and the update channel «win7»
+        # (the app then reads win7.yml, never latest.yml or ia32.yml).
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const b = pkg.build;
+            b.win.target = [{ target: "nsis", arch: ["x64", "ia32"] }];
+            b.win.artifactName = String(b.win.artifactName).replace(".${ext}", "-win7.${ext}");
+            b.publish = (Array.isArray(b.publish) ? b.publish : [b.publish]).map((p) => ({ ...p, channel: "win7" }));
+            b.electronVersion = process.env.ELECTRON7;
+            b.extraMetadata = { ...(b.extraMetadata || {}), version: process.env.VERSION };
+            fs.writeFileSync("build-win7.json", JSON.stringify(b, null, 1));
+            console.log(b.win.artifactName, b.electronVersion);
+          '
+
+      - name: Package
+        working-directory: apps/desktop
+        shell: bash
+        run: npx electron-builder --win nsis --x64 --ia32 --publish never --config build-win7.json
+
+      # Windows refuses a program whose headers ask for a newer system; 6.1 is Windows 7.
+      - name: Headers allow Windows 7
+        working-directory: apps/desktop
+        run: node scripts/check-pe.mjs 6.1 dist/win-unpacked dist/win-ia32-unpacked
+
+      - name: Launch check
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          foreach ($d in @("dist\win-unpacked", "dist\win-ia32-unpacked")) {
+            $exe = Get-ChildItem "$d\*.exe" | Select-Object -First 1
+            $p = Start-Process $exe.FullName -PassThru
+            Start-Sleep -Seconds 30
+            if ($p.HasExited) { throw "$d exited within 30 seconds (code $($p.ExitCode))" }
+            Stop-Process -Id $p.Id -Force
+            Start-Sleep -Seconds 3
+            Get-Content "$d\resources\app-update.yml"
+          }
+          Get-Content dist\win7.yml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-win7
+          path: |
+            apps/desktop/dist/*-win7.exe
+            apps/desktop/dist/*-win7.exe.blockmap
+            apps/desktop/dist/win7.yml
           if-no-files-found: error
           retention-days: 3
 
