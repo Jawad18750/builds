@@ -17,6 +17,13 @@ on:
         description: macOS
         type: boolean
         default: true
+      win32:
+        description: Windows 32-bit (its own update channel)
+        type: boolean
+        default: false
+      electron32:
+        description: Electron for the 32-bit build (the last line that ships win32-ia32)
+        default: '43.8.13'
 
 permissions:
   contents: read
@@ -81,6 +88,91 @@ jobs:
             apps/desktop/dist/*.exe
             apps/desktop/dist/*.blockmap
             apps/desktop/dist/latest.yml
+          if-no-files-found: error
+          retention-days: 3
+
+
+  build32:
+    if: inputs.win32
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Mask
+        shell: bash
+        env:
+          MASK: ${{ secrets.MASK_WORDS }}
+        run: printf '%s\n' "$MASK" | while IFS= read -r w; do [ -n "$w" ] && echo "::add-mask::$w"; done; true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.D_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.D_REPO_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the web workspaces
+        run: npm ci --no-audit --no-fund --workspace packages/core --workspace packages/data --workspace packages/paper --include-workspace-root
+
+      - name: Install the shell
+        working-directory: apps/desktop
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the web bundle
+        working-directory: apps/desktop
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: npm run web
+
+      - name: The 32-bit config
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          ELECTRON32: ${{ inputs.electron32 }}
+        # The package's own build config, changed only where 32-bit differs: the arch, an
+        # «-ia32» file name, the Electron line that still ships ia32, and the update channel
+        # «ia32» (the app then reads ia32.yml, never the 64-bit latest.yml).
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const b = pkg.build;
+            b.win.target = [{ target: "nsis", arch: ["ia32"] }];
+            b.win.artifactName = String(b.win.artifactName).replace(".${ext}", "-ia32.${ext}");
+            b.publish = (Array.isArray(b.publish) ? b.publish : [b.publish]).map((p) => ({ ...p, channel: "ia32" }));
+            b.electronVersion = process.env.ELECTRON32;
+            b.extraMetadata = { ...(b.extraMetadata || {}), version: process.env.VERSION };
+            fs.writeFileSync("build-ia32.json", JSON.stringify(b, null, 1));
+            console.log(b.win.artifactName, b.electronVersion);
+          '
+
+      - name: Package
+        working-directory: apps/desktop
+        shell: bash
+        run: npx electron-builder --win nsis --ia32 --publish never --config build-ia32.json
+
+      - name: Launch check
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist\win-ia32-unpacked\*.exe | Select-Object -First 1
+          $p = Start-Process $exe.FullName -PassThru
+          Start-Sleep -Seconds 30
+          if ($p.HasExited) { throw "the app exited within 30 seconds (code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+          Get-Content dist\ia32.yml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-ia32
+          path: |
+            apps/desktop/dist/*.exe
+            apps/desktop/dist/*.blockmap
+            apps/desktop/dist/ia32.yml
           if-no-files-found: error
           retention-days: 3
 
