@@ -17,12 +17,13 @@ on:
         type: boolean
         default: true
       xcode:
-        description: 'Xcode version on the image, e.g. 27.1 (empty = the newest release)'
+        description: 'Xcode version on the image (default 26.6; empty = the newest release on the image)'
         required: false
+        default: '26.6'
       image:
-        description: 'Runner image: xcode-27 (default) or macos-26 (Xcode 26)'
+        description: 'Runner image: macos-26 (default, Xcode 26) or xcode-27 (only once the app adopts the UIScene lifecycle: an Xcode 27 build without it crashes at launch)'
         required: false
-        default: 'xcode-27'
+        default: 'macos-26'
       verbose:
         description: 'Print the whole archive log (to read a failing compile)'
         type: boolean
@@ -53,7 +54,7 @@ env:
 jobs:
   ios:
     # Xcode 27 (iOS 27 SDK): required for uploads from April 2027 (ITMS-90725). The xcode-27 image is the one that carries it.
-    runs-on: ${{ inputs.image || 'xcode-27' }}
+    runs-on: ${{ inputs.image || 'macos-26' }}
     timeout-minutes: 180
     outputs:
       build: ${{ steps.number.outputs.build }}
